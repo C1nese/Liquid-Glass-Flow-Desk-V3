@@ -973,10 +973,9 @@ def build_composite_signal_figure(signals_by_exchange: Dict[str, list]) -> go.Fi
 
 
 def build_composite_radar_html(signal: "CompositeSignal") -> str:
-    """单个合成信号的雷达/条形HTML可视化"""
+    """五因子合成信号条形可视化"""
     if signal is None:
-        return "<div style='color:#aaa;font-size:0.85rem;'>等待合成信号数据…</div>"
-
+        return '<div style="color:#aaa;font-size:0.85rem;">等待合成信号数据…</div>'
     factors = [
         ("价格动能", signal.price_score,  "#62c2ff"),
         ("OI方向",   signal.oi_score,     "#1dc796"),
@@ -986,40 +985,53 @@ def build_composite_radar_html(signal: "CompositeSignal") -> str:
     ]
     rows_html = ""
     for name, score, color in factors:
-        pct_pos = max(0, score) * 50   # 0-50% right of center
-        pct_neg = max(0, -score) * 50  # 0-50% left of center
-        fill_right = f"<div style='width:{pct_pos:.1f}%;height:100%;background:{color};border-radius:0 3px 3px 0;'></div>"
-        fill_left  = f"<div style='width:{pct_neg:.1f}%;height:100%;background:#ff6868;border-radius:3px 0 0 3px;margin-left:auto;'></div>"
-        score_str  = f"{score:+.2f}"
-        rows_html += f"""
-        <div style="display:flex;align-items:center;margin-bottom:5px;gap:6px;">
-          <span style="width:60px;font-size:0.75rem;color:#bcd;text-align:right;">{name}</span>
-          <div style="flex:1;height:8px;background:rgba(255,255,255,0.08);border-radius:4px;display:flex;overflow:hidden;">
-            <div style="width:50%;display:flex;justify-content:flex-end;">{fill_left}</div>
-            <div style="width:1px;background:rgba(255,255,255,0.3);"></div>
-            <div style="width:50%;display:flex;">{fill_right}</div>
-          </div>
-          <span style="width:36px;font-size:0.75rem;color:{color};font-weight:600;">{score_str}</span>
-        </div>"""
-
-    label   = signal.signal_label
-    color   = signal.signal_color
-    comp    = signal.composite_score
-    conf    = signal.confidence
-    conf_w  = int(conf * 100)
-    conf_col= "#1dc796" if conf > 0.6 else "#ffa94d" if conf > 0.35 else "#ff6868"
-    return f"""
-    <div style="padding:14px 16px;border-radius:18px;border:1px solid rgba(255,255,255,0.14);
-        background:rgba(255,255,255,0.06);backdrop-filter:blur(20px);">
-      <div style="font-size:0.7rem;color:#bcd;text-transform:uppercase;letter-spacing:0.1em;margin-bottom:6px;">合成信号 Composite</div>
-      <div style="font-size:1.4rem;font-weight:800;color:{color};margin-bottom:8px;">{label}</div>
-      <div style="font-size:0.8rem;color:#aac;margin-bottom:10px;">综合分 {comp:+.3f} | 置信度 {conf:.0%}</div>
-      <div style="width:100%;height:4px;background:rgba(255,255,255,0.1);border-radius:2px;margin-bottom:12px;">
-        <div style="width:{conf_w}%;height:100%;background:{conf_col};border-radius:2px;transition:width 0.4s;"></div>
-      </div>
-      {rows_html}
-    </div>"""
-
+        pct_pos   = max(0, score) * 50
+        pct_neg   = max(0, -score) * 50
+        score_str = "{:+.2f}".format(score)
+        fill_right = (
+            '<div style="width:{:.1f}%;height:100%;background:{};'
+            'border-radius:0 3px 3px 0;"></div>'
+        ).format(pct_pos, color)
+        fill_left = (
+            '<div style="width:{:.1f}%;height:100%;background:#ff6868;'
+            'border-radius:3px 0 0 3px;margin-left:auto;"></div>'
+        ).format(pct_neg)
+        rows_html += (
+            '<div style="display:flex;align-items:center;margin-bottom:5px;gap:6px;">'
+            '<span style="width:60px;font-size:0.75rem;color:#bcd;text-align:right;">{name}</span>'
+            '<div style="flex:1;height:8px;background:rgba(255,255,255,0.08);'
+            'border-radius:4px;display:flex;overflow:hidden;">'
+            '<div style="width:50%;display:flex;justify-content:flex-end;">{fl}</div>'
+            '<div style="width:1px;background:rgba(255,255,255,0.3);"></div>'
+            '<div style="width:50%;display:flex;">{fr}</div>'
+            '</div>'
+            '<span style="width:36px;font-size:0.75rem;color:{color};font-weight:600;">{score}</span>'
+            '</div>'
+        ).format(name=name, fl=fill_left, fr=fill_right, color=color, score=score_str)
+    label     = signal.signal_label
+    sig_col   = signal.signal_color
+    comp_str  = "{:+.3f}".format(signal.composite_score)
+    conf_pct  = "{:.0%}".format(signal.confidence)
+    conf_w    = int(signal.confidence * 100)
+    conf_col  = "#1dc796" if signal.confidence > 0.6 else "#ffa94d" if signal.confidence > 0.35 else "#ff6868"
+    return (
+        '<div style="padding:14px 16px;border-radius:18px;'
+        'border:1px solid rgba(255,255,255,0.14);'
+        'background:rgba(255,255,255,0.06);backdrop-filter:blur(20px);">'
+        '<div style="font-size:0.7rem;color:#bcd;text-transform:uppercase;'
+        'letter-spacing:0.1em;margin-bottom:6px;">合成信号 Composite</div>'
+        '<div style="font-size:1.4rem;font-weight:800;color:{sig_col};margin-bottom:8px;">{label}</div>'
+        '<div style="font-size:0.8rem;color:#aac;margin-bottom:10px;">'
+        '综合分 {comp} | 置信度 {conf_pct}</div>'
+        '<div style="width:100%;height:4px;background:rgba(255,255,255,0.1);'
+        'border-radius:2px;margin-bottom:12px;">'
+        '<div style="width:{conf_w}%;height:100%;background:{conf_col};'
+        'border-radius:2px;transition:width 0.4s;"></div>'
+        '</div>'
+        '{rows}'
+        '</div>'
+    ).format(sig_col=sig_col, label=label, comp=comp_str, conf_pct=conf_pct,
+             conf_w=conf_w, conf_col=conf_col, rows=rows_html)
 
 # ══════════════════════════════════════════════════════════════════════════════
 # NEW: Liquidation Cluster V2 figure

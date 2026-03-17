@@ -577,3 +577,138 @@ def fetch_binance_long_short_count(symbol, interval, limit, timeout=DEFAULT_TIME
 
 def fetch_binance_taker_ratio(symbol, interval, limit, timeout=DEFAULT_TIMEOUT):
     return BinanceClient(timeout).fetch_taker_long_short_ratio(symbol, interval, limit)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# v5 — 全市场批量扫描
+# ══════════════════════════════════════════════════════════════════════════════
+
+MARKET_SCAN_COINS = [
+    "BTC","ETH","SOL","XRP","BNB","DOGE","ADA","SUI","AVAX",
+    "LINK","LTC","TON","HYPE","TAO","PEPE","WIF","TRUMP","FARTCOIN",
+    "PENDLE","OP","ARB","TIA","INJ","SEI","APT","NEAR","FIL","ATOM",
+]
+
+SPOT_EXCHANGES_EXTRA = {
+    "binance_spot": "https://api.binance.com",
+    "okx_spot":     "https://www.okx.com",
+    "bybit_spot":   "https://api.bybit.com",
+}
+
+
+class MarketScanClient(BaseClient):
+    """全市场批量扫描 — 使用 Binance 公开端点，无需 API Key"""
+    exchange_name = "MarketScan"
+    base_url      = "https://fapi.binance.com"
+    spot_base     = "https://api.binance.com"
+
+    def fetch_all_tickers(self) -> Dict[str, dict]:
+        """获取所有永续合约 ticker（批量，一次请求）"""
+        try:
+            data = self._get("/fapi/v1/ticker/24hr")
+            if isinstance(data, list):
+                return {d["symbol"]: d for d in data}
+            return {}
+        except: return {}
+
+    def fetch_all_oi(self) -> Dict[str, float]:
+        """获取所有永续合约当前OI（逐个取，仅取 USDT 合约）"""
+        results = {}
+        try:
+            tickers = self._get("/fapi/v1/ticker/24hr")
+            for t in (tickers if isinstance(tickers, list) else []):
+                sym = t.get("symbol", "")
+                if not sym.endswith("USDT"): continue
+                price = safe_float(t.get("lastPrice"))
+                try:
+                    oi_r = self._get("/fapi/v1/openInterest", {"symbol": sym})
+                    oi   = safe_float(oi_r.get("openInterest"))
+                    if oi and price: results[sym] = oi * price
+                except: pass
+        except: pass
+        return results
+
+    def fetch_coin_summary(self, coin: str) -> dict:
+        """单币种综合摘要：price, oi, funding, 24h vol, 24h liq"""
+        sym = f"{coin.upper()}USDT"
+        result = {"coin": coin, "symbol": sym}
+        try:
+            ticker = self._get("/fapi/v1/ticker/24hr", {"symbol": sym})
+            result["price"]       = safe_float(ticker.get("lastPrice"))
+            result["price_chg_pct"] = safe_float(ticker.get("priceChangePercent"))
+            result["vol_24h"]     = safe_float(ticker.get("quoteVolume"))
+            result["high_24h"]    = safe_float(ticker.get("highPrice"))
+            result["low_24h"]     = safe_float(ticker.get("lowPrice"))
+        except: pass
+        try:
+            prem = self._get("/fapi/v1/premiumIndex", {"symbol": sym})
+            result["funding"]    = safe_float(prem.get("lastFundingRate"))
+            result["mark_price"] = safe_float(prem.get("markPrice"))
+            result["index_price"]= safe_float(prem.get("indexPrice"))
+        except: pass
+        try:
+            oi_r  = self._get("/fapi/v1/openInterest", {"symbol": sym})
+            oi    = safe_float(oi_r.get("openInterest"))
+            price = result.get("price") or result.get("mark_price")
+            result["oi"] = oi * price if oi and price else None
+        except: pass
+        try:
+            liq_r = self._get("/fapi/v1/allForceOrders", {"symbol": sym, "limit": 100})
+            items = liq_r if isinstance(liq_r, list) else []
+            now_ms = int(time.time() * 1000)
+            cutoff = now_ms - 86_400_000
+            long_n = short_n = 0.0
+            for item in items:
+                ts = safe_int(item.get("time")) or 0
+                if ts < cutoff: continue
+                price = safe_float(item.get("avgPrice")) or safe_float(item.get("price")) or 0
+                qty   = safe_float(item.get("executedQty")) or safe_float(item.get("origQty")) or 0
+                n     = price * qty
+                side  = str(item.get("side","")).upper()
+                if side == "SELL": long_n  += n   # long liquidated = sell order
+                else:              short_n += n
+            result["liq_long_24h"]  = long_n
+            result["liq_short_24h"] = short_n
+            result["liq_total_24h"] = long_n + short_n
+        except: pass
+        try:
+            gl_r = self._get("/futures/data/globalLongShortAccountRatio",
+                             {"symbol": sym, "period": "5m", "limit": 1})
+            if gl_r:
+                result["ls_ratio"] = safe_float(gl_r[-1].get("longShortRatio"))
+        except: pass
+        try:
+            spot_r = requests.get(f"{self.spot_base}/api/v3/ticker/24hr",
+                                  params={"symbol": sym}, timeout=self.timeout)
+            spot_r.raise_for_status()
+            sd = spot_r.json()
+            result["spot_vol_24h"] = safe_float(sd.get("quoteVolume"))
+        except: pass
+        # OI history for 1h change
+        try:
+            oi_hist = self._get("/futures/data/openInterestHist",
+                                {"symbol": sym, "period": "1h", "limit": 25})
+            if len(oi_hist) >= 2:
+                v_now  = safe_float(oi_hist[-1].get("sumOpenInterestValue")) or 0
+                v_1h   = safe_float(oi_hist[-2].get("sumOpenInterestValue")) or 0
+                v_24h  = safe_float(oi_hist[0].get("sumOpenInterestValue"))  or 0
+                result["oi_change_1h_pct"]  = (v_now - v_1h)  / v_1h  * 100 if v_1h  else None
+                result["oi_change_24h_pct"] = (v_now - v_24h) / v_24h * 100 if v_24h else None
+        except: pass
+        return result
+
+    def fetch_market_batch(self, coins: List[str], max_workers: int = 8) -> List[dict]:
+        """并发批量扫描多个币种"""
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        results = []
+        with ThreadPoolExecutor(max_workers=max_workers) as exe:
+            futs = {exe.submit(self.fetch_coin_summary, c): c for c in coins}
+            for fut in as_completed(futs):
+                try: results.append(fut.result())
+                except: pass
+        results.sort(key=lambda x: x.get("oi") or 0, reverse=True)
+        return results
+
+
+def build_market_scan_client(timeout: int = DEFAULT_TIMEOUT) -> MarketScanClient:
+    return MarketScanClient(timeout)

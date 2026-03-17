@@ -1190,3 +1190,127 @@ class LiveTerminalService:
                 book.asks={float(r["px"]):float(r["sz"]) for r in levels[1] if float(r.get("sz",0))>0}
                 book.is_ready=True; book.timestamp_ms=int(time.time()*1000)
                 self._detect_orderbook_patterns_locked("hyperliquid", book)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# v5 patch — appended to LiveTerminalService
+# Wall Life Tracking + Large Order Flow + Near Liquidity Collapse
+# ══════════════════════════════════════════════════════════════════════════════
+
+    # These methods are appended — they reference self and the existing __init__ state
+    # They are called from _detect_orderbook_patterns_locked (already exists above)
+
+def _v5_init_extra(self):
+    """Call from __init__ to add v5 state — monkey-patch approach"""
+    from collections import deque
+    self.wall_life:       Dict[str, Dict[float, "WallLifePoint"]] = {k: {} for k in EXCHANGE_ORDER}
+    self.wall_life_hist:  Dict[str, Deque]     = {k: deque(maxlen=500) for k in EXCHANGE_ORDER}
+    self.liq_collapses:   Dict[str, Deque]     = {k: deque(maxlen=200) for k in EXCHANGE_ORDER}
+    self.large_order_flow:Dict[str, Deque]     = {k: deque(maxlen=1000) for k in EXCHANGE_ORDER}
+    self._large_order_threshold = 50_000       # $50K = 大单
+    self._v5_ready = True
+
+def _v5_track_wall_life_locked(self, ek: str, book: "LocalOrderBook"):
+    """Track how long each large order stays in the book"""
+    if not hasattr(self, '_v5_ready'): return
+    from models import WallLifePoint, NearLiquidityCollapse
+    now_ms = int(time.time() * 1000)
+    LARGE_WALL = 200_000   # $200K threshold for wall tracking
+    mid = book.mid_price()
+
+    current_walls: Dict[float, float] = {}
+    for p, s in {**book.bids, **book.asks}.items():
+        n = p * s
+        if n >= LARGE_WALL:
+            current_walls[p] = n
+
+    existing = self.wall_life.get(ek, {})
+
+    # Update existing walls
+    for price, notional in current_walls.items():
+        side = "bid" if price in book.bids else "ask"
+        if price in existing:
+            wp = existing[price]
+            wp.age_ms = now_ms - wp.born_ms
+            wp.size   = book.bids.get(price, book.asks.get(price, 0))
+            wp.notional = notional
+            wp.is_alive = True
+        else:
+            existing[price] = WallLifePoint(
+                timestamp_ms=now_ms, exchange=ek, side=side,
+                price=price, size=notional/max(price,1),
+                notional=notional, born_ms=now_ms, age_ms=0, is_alive=True)
+
+    # Detect walls that disappeared (near-price collapse)
+    dead_prices = [p for p in list(existing.keys()) if p not in current_walls]
+    for price in dead_prices:
+        wp = existing.pop(price)
+        wp.is_alive  = False
+        wp.age_ms    = now_ms - wp.born_ms
+        self.wall_life_hist[ek].append(wp)
+        # Near-price liquidity collapse?
+        if mid and mid > 0:
+            dist_pct = abs(price - mid) / mid * 100
+            if dist_pct < 1.5 and wp.notional >= 100_000:  # within 1.5% of mid
+                collapse = NearLiquidityCollapse(
+                    timestamp_ms=now_ms, exchange=ek,
+                    side="bid" if wp.side == "bid" else "ask",
+                    price_pct_from_mid=dist_pct,
+                    notional_lost=wp.notional,
+                    collapse_speed_ms=max(wp.age_ms, 100))
+                self.liq_collapses[ek].append(collapse)
+
+    self.wall_life[ek] = existing
+
+def _v5_track_large_trade_locked(self, ek: str, trade: "TradeEvent"):
+    """Filter and record large trades for big-order flow view"""
+    if not hasattr(self, '_v5_ready'): return
+    if trade.notional < getattr(self, '_large_order_threshold', 50_000): return
+    from models import LargeOrderFlow
+    lof = LargeOrderFlow(
+        timestamp_ms=trade.timestamp_ms, exchange=ek,
+        side=trade.side, price=trade.price,
+        notional=trade.notional, is_aggressor=True)
+    self.large_order_flow[ek].append(lof)
+
+
+# Monkey-patch LiveTerminalService with v5 methods
+LiveTerminalService._v5_init_extra       = _v5_init_extra
+LiveTerminalService._v5_track_wall_life  = _v5_track_wall_life_locked
+LiveTerminalService._v5_track_large_trade= _v5_track_large_trade_locked
+
+# Patch __init__ to call _v5_init_extra
+_orig_init = LiveTerminalService.__init__
+def _patched_init(self, *args, **kwargs):
+    _orig_init(self, *args, **kwargs)
+    self._v5_init_extra()
+LiveTerminalService.__init__ = _patched_init
+
+# Patch _append_trade_locked to also call v5 large trade tracker
+_orig_append_trade = LiveTerminalService._append_trade_locked
+def _patched_append_trade(self, ek, trade):
+    _orig_append_trade(self, ek, trade)
+    self._v5_track_large_trade(ek, trade)
+LiveTerminalService._append_trade_locked = _patched_append_trade
+
+# Patch _detect_orderbook_patterns_locked to also call v5 wall tracker
+_orig_detect = LiveTerminalService._detect_orderbook_patterns_locked
+def _patched_detect(self, ek, book):
+    _orig_detect(self, ek, book)
+    self._v5_track_wall_life(ek, book)
+LiveTerminalService._detect_orderbook_patterns_locked = _patched_detect
+
+# Add v5 public getters
+def _get_wall_life_history(self, ek):
+    with self.lock: return list(self.wall_life_hist.get(ek, []))
+def _get_active_walls(self, ek):
+    with self.lock: return dict(self.wall_life.get(ek, {}))
+def _get_liq_collapses(self, ek):
+    with self.lock: return list(self.liq_collapses.get(ek, []))
+def _get_large_order_flow(self, ek):
+    with self.lock: return list(self.large_order_flow.get(ek, []))
+
+LiveTerminalService.get_wall_life_history  = _get_wall_life_history
+LiveTerminalService.get_active_walls       = _get_active_walls
+LiveTerminalService.get_liq_collapses      = _get_liq_collapses
+LiveTerminalService.get_large_order_flow   = _get_large_order_flow

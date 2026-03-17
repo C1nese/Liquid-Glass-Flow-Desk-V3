@@ -430,3 +430,203 @@ class RecordedFrame:
     spread_bps: Dict[str, Optional[float]]
     composite_signals: Dict[str, "CompositeSignal"]
     funding_rates: Dict[str, Optional[float]]
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# v5 — 全市场总览、异动榜、深度页、告警中心、爆仓中心、盘口中心
+# ══════════════════════════════════════════════════════════════════════════════
+
+@dataclass
+class CoinMarketRow:
+    """全市场总览表的一行 — 按币种聚合跨所数据"""
+    coin: str
+    price: Optional[float] = None
+    price_change_24h_pct: Optional[float] = None
+    oi_total: Optional[float] = None          # 跨所合计OI
+    oi_change_1h_pct: Optional[float] = None  # OI 1h变化%
+    oi_change_24h_pct: Optional[float] = None # OI 24h变化%
+    funding_avg: Optional[float] = None       # 各所资金费率均值 (bps)
+    liq_24h_total: Optional[float] = None     # 24h总爆仓额
+    liq_long_pct: Optional[float] = None      # 多头爆仓占比%
+    long_short_ratio: Optional[float] = None  # 全市场多空账户比
+    spot_perp_ratio: Optional[float] = None   # 现货成交量/OI
+    lead_lag_status: str = "–"                # 现货先行/合约先行/中性
+    composite_label: str = "–"               # 合成信号标签
+    composite_score: float = 0.0
+    top_exchange: str = ""                    # OI最大的所
+
+
+@dataclass
+class AnomalyEntry:
+    """异动榜条目"""
+    rank: int
+    coin: str
+    category: str      # oi_surge / liq_spike / funding_extreme / spot_lead / crowd_exhaust
+    value: float       # 主要指标值
+    value_label: str   # 格式化显示
+    direction: str     # "bull" / "bear" / "neutral"
+    exchange: str
+    detail: str        # 一句话解读
+
+
+@dataclass
+class MarketConclusion:
+    """主结论区"""
+    timestamp_ms: int
+    label: str          # 偏多推进/偏空推进/拥挤回落风险/现货先动/中性观望
+    color: str
+    confidence: float
+    reasons: List[str]  # 支撑该结论的理由列表
+    watchlist: List[str]  # 值得重点关注的币种
+
+
+@dataclass
+class WallLifePoint:
+    """墙体寿命追踪点"""
+    timestamp_ms: int
+    exchange: str
+    side: str           # bid / ask
+    price: float
+    size: float
+    notional: float
+    born_ms: int        # 首次出现时间
+    age_ms: int         # 当前存续时长
+    is_alive: bool      # 是否还在
+
+
+@dataclass
+class NearLiquidityCollapse:
+    """近价流动性塌陷事件"""
+    timestamp_ms: int
+    exchange: str
+    side: str
+    price_pct_from_mid: float   # 距中间价的百分比
+    notional_lost: float        # 消失的名义金额
+    collapse_speed_ms: int      # 多快消失的
+
+
+@dataclass
+class LargeOrderFlow:
+    """大单流（成交）"""
+    timestamp_ms: int
+    exchange: str
+    side: str
+    price: float
+    notional: float
+    is_aggressor: bool   # True=主动成交(吃单)
+
+
+@dataclass
+class MultiExchangeLiqSummary:
+    """爆仓中心 — 单币种跨时间窗口摘要"""
+    coin: str
+    window_label: str     # "5m" / "1h" / "4h" / "24h"
+    long_notional: float
+    short_notional: float
+    long_count: int
+    short_count: int
+    by_exchange: Dict[str, float]   # exchange -> notional
+    cluster_count: int
+    cross_ex_cluster_count: int
+    dominant_side: str
+    peak_cluster_notional: float
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# v5 — 全市场总览、异动榜、深度页、告警中心、爆仓中心、盘口中心
+# ══════════════════════════════════════════════════════════════════════════════
+
+@dataclass
+class CoinMarketRow:
+    """全市场总览表的一行"""
+    coin: str
+    price: Optional[float] = None
+    price_change_24h_pct: Optional[float] = None
+    oi_total: Optional[float] = None
+    oi_change_1h_pct: Optional[float] = None
+    oi_change_24h_pct: Optional[float] = None
+    funding_avg: Optional[float] = None
+    liq_24h_total: Optional[float] = None
+    liq_long_pct: Optional[float] = None
+    long_short_ratio: Optional[float] = None
+    spot_perp_ratio: Optional[float] = None
+    lead_lag_status: str = "–"
+    composite_label: str = "–"
+    composite_score: float = 0.0
+    top_exchange: str = ""
+
+
+@dataclass
+class AnomalyEntry:
+    """异动榜条目"""
+    rank: int
+    coin: str
+    category: str
+    value: float
+    value_label: str
+    direction: str
+    exchange: str
+    detail: str
+
+
+@dataclass
+class MarketConclusion:
+    """主结论区"""
+    timestamp_ms: int
+    label: str
+    color: str
+    confidence: float
+    reasons: List[str]
+    watchlist: List[str]
+
+
+@dataclass
+class WallLifePoint:
+    """墙体寿命追踪"""
+    timestamp_ms: int
+    exchange: str
+    side: str
+    price: float
+    size: float
+    notional: float
+    born_ms: int
+    age_ms: int
+    is_alive: bool
+
+
+@dataclass
+class NearLiquidityCollapse:
+    """近价流动性塌陷"""
+    timestamp_ms: int
+    exchange: str
+    side: str
+    price_pct_from_mid: float
+    notional_lost: float
+    collapse_speed_ms: int
+
+
+@dataclass
+class LargeOrderFlow:
+    """大单流"""
+    timestamp_ms: int
+    exchange: str
+    side: str
+    price: float
+    notional: float
+    is_aggressor: bool
+
+
+@dataclass
+class MultiExchangeLiqSummary:
+    """爆仓中心摘要"""
+    coin: str
+    window_label: str
+    long_notional: float
+    short_notional: float
+    long_count: int
+    short_count: int
+    by_exchange: Dict[str, float]
+    cluster_count: int
+    cross_ex_cluster_count: int
+    dominant_side: str
+    peak_cluster_notional: float
