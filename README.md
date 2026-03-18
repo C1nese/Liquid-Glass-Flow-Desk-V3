@@ -4,7 +4,10 @@
 > 基于 Streamlit 构建，WebSocket 驱动，支持 Binance / Bybit / OKX / Hyperliquid 四所并发数据。
 
 ---
-
+<img width="1885" height="896" alt="image" src="https://github.com/user-attachments/assets/cc4b5860-700e-4502-ade7-b90ad7606a62" />
+<img width="1513" height="900" alt="image" src="https://github.com/user-attachments/assets/44d039aa-25e7-4a4c-aa5b-334b8012c3c3" />
+<img width="1586" height="864" alt="image" src="https://github.com/user-attachments/assets/d9430939-b4d8-4bfc-8993-68291e0636b9" />
+剩下的自己去启动 ，懒得截图了
 ## 目录
 
 - [功能概览](#功能概览)
