@@ -52,6 +52,60 @@ def _parse_side_label(side: str) -> str:
 
 
 # ══════════════════════════════════════════════════════════════════════════
+# P1 新增技术指标计算函数
+# ══════════════════════════════════════════════════════════════════════════
+
+def _calc_macd(series: "pd.Series", fast: int = 12, slow: int = 26,
+               signal: int = 9) -> tuple:
+    """MACD (12,26,9)：DIF / DEA / 柱状图 Histogram
+    DIF = EMA(fast) - EMA(slow)
+    DEA = EMA(DIF, signal)
+    Hist = (DIF - DEA) * 2
+    柱 > 0 且向上 = 多头加速；柱 < 0 且向下 = 空头加速
+    """
+    ema_f = series.ewm(span=fast,   adjust=False).mean()
+    ema_s = series.ewm(span=slow,   adjust=False).mean()
+    dif   = ema_f - ema_s
+    dea   = dif.ewm(span=signal, adjust=False).mean()
+    hist  = (dif - dea) * 2
+    return dif, dea, hist
+
+
+def _calc_atr(high: "pd.Series", low: "pd.Series", close: "pd.Series",
+              n: int = 14) -> "pd.Series":
+    """ATR 真实波动率 (EMA法)
+    TR = max(H-L, |H-PC|, |L-PC|)
+    ATR = EMA(TR, n)
+    用途：止损参考、仓位管理、突破判断
+    """
+    pc  = close.shift(1)
+    tr  = pd.concat([high - low, (high - pc).abs(), (low - pc).abs()], axis=1).max(axis=1)
+    return tr.ewm(span=n, adjust=False).mean()
+
+
+def _calc_stoch_rsi(close: "pd.Series", rsi_n: int = 14,
+                    stoch_n: int = 14, smooth_k: int = 3,
+                    smooth_d: int = 3) -> tuple:
+    """Stochastic RSI：RSI 的随机指标化版本，捕捉 RSI 自身的超买超卖
+    %K > 80 超买；%K < 20 超卖；K 穿 D 产生信号
+    返回 (stoch_k, stoch_d)
+    """
+    delta = close.diff()
+    gain  = delta.clip(lower=0).rolling(rsi_n, min_periods=1).mean()
+    loss  = (-delta.clip(upper=0)).rolling(rsi_n, min_periods=1).mean()
+    rs    = gain / loss.replace(0, float("nan"))
+    rsi   = 100 - 100 / (1 + rs)
+
+    rsi_min = rsi.rolling(stoch_n, min_periods=1).min()
+    rsi_max = rsi.rolling(stoch_n, min_periods=1).max()
+    rng     = (rsi_max - rsi_min).replace(0, float("nan"))
+    raw_k   = (rsi - rsi_min) / rng * 100
+    k       = raw_k.rolling(smooth_k, min_periods=1).mean()
+    d       = k.rolling(smooth_d, min_periods=1).mean()
+    return k, d
+
+
+# ══════════════════════════════════════════════════════════════════════════
 # 1. Orderbook summary
 # ══════════════════════════════════════════════════════════════════════════
 
@@ -1428,13 +1482,11 @@ def build_bull_bear_power_figure(snapshots: list, ob_levels: dict,
         title={"text": "买卖力量", "font": {"size": 12}},
     ), row=1, col=3)
 
-# 用 add_shape 代替 add_hline，避免 Indicator 子图无 xaxis 导致的报错
-    for _col, _yref in [(1, "y"), (2, "y2")]:
-        fig.add_shape(
-            type="line", xref="paper", yref=_yref,
-            x0=0, x1=1, y0=0, y1=0,
-            line=dict(color="rgba(255,255,255,0.2)", width=1),
-        )
+    # P0 Fix: 用 add_shape 代替 add_hline 避免 Plotly 对 Indicator 子图检查 xaxis 崩溃
+    for _yref in ("y", "y2"):
+        fig.add_shape(type="line", xref="paper", yref=_yref,
+                      x0=0, x1=1, y0=0, y1=0,
+                      line=dict(color="rgba(255,255,255,0.2)", width=1))
     fig.update_layout(
         height=320, barmode="relative",
         template="plotly_dark",
@@ -1492,3 +1544,857 @@ def detect_hot_coins(market_rows: list, top_n: int = 5) -> list:
 
     scored.sort(key=lambda x: x["score"], reverse=True)
     return scored[:top_n]
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# P1 新增：MACD / ATR 技术指标计算与独立图表
+# ══════════════════════════════════════════════════════════════════════════
+
+def calc_macd(series, fast: int = 12, slow: int = 26, signal: int = 9):
+    """
+    计算 MACD 三线：
+      DIF  = EMA(fast) - EMA(slow)
+      DEA  = EMA(DIF, signal)
+      HIST = (DIF - DEA) * 2  （柱状图，标准算法 × 2）
+    返回 (dif, dea, hist) 三个 pd.Series
+    """
+    ema_fast = series.ewm(span=fast,   adjust=False).mean()
+    ema_slow = series.ewm(span=slow,   adjust=False).mean()
+    dif  = ema_fast - ema_slow
+    dea  = dif.ewm(span=signal, adjust=False).mean()
+    hist = (dif - dea) * 2
+    return dif, dea, hist
+
+
+def calc_atr(high, low, close, n: int = 14):
+    """
+    ATR 真实波动范围（Wilder EMA 平滑）。
+    反映近期波动率，用于止损距离、仓位管理参考。
+    """
+    prev_close = close.shift(1)
+    tr = pd.concat([
+        (high - low).abs(),
+        (high - prev_close).abs(),
+        (low  - prev_close).abs(),
+    ], axis=1).max(axis=1)
+    return tr.ewm(span=n, adjust=False).mean()
+
+
+def build_macd_atr_figure(candles: List, show_macd: bool = True,
+                           show_atr: bool = True):
+    """
+    独立的 MACD + ATR 双子图，嵌入 K 线图下方。
+    - 上半：MACD 柱状图 + DIF / DEA 线（绿柱=多头动能 / 红柱=空头动能）
+    - 下半：ATR 面积图 + 均值参考线（橙色=当前波动率）
+    返回 go.Figure 或 None（无数据时）
+    """
+    if not candles or (not show_macd and not show_atr):
+        return None
+
+    df = pd.DataFrame({
+        "ts": pd.to_datetime([c.timestamp_ms for c in candles], unit="ms"),
+        "c":  [c.close for c in candles],
+        "h":  [c.high  for c in candles],
+        "l":  [c.low   for c in candles],
+    })
+
+    n_rows = int(show_macd) + int(show_atr)
+    if n_rows == 0:
+        return None
+
+    row_titles = []
+    if show_macd: row_titles.append("MACD (12,26,9)  |  绿柱=多头动能  红柱=空头动能")
+    if show_atr:  row_titles.append("ATR (14)  ·  真实波动率  |  橙线=当前均值")
+
+    heights = [0.6, 0.4] if n_rows == 2 else [1.0]
+    fig = make_subplots(rows=n_rows, cols=1, shared_xaxes=True,
+                        vertical_spacing=0.06, row_heights=heights,
+                        subplot_titles=row_titles)
+
+    cur_row = 1
+
+    # ── MACD ──────────────────────────────────────────────────────────────
+    if show_macd and len(df) >= 26:
+        dif, dea, hist = calc_macd(df["c"])
+        hist_colors = ["#1dc796" if v >= 0 else "#ff6868" for v in hist.fillna(0)]
+        fig.add_trace(go.Bar(
+            x=df["ts"], y=hist, name="MACD柱",
+            marker_color=hist_colors, opacity=0.78), row=cur_row, col=1)
+        fig.add_trace(go.Scatter(
+            x=df["ts"], y=dif, mode="lines", name="DIF",
+            line=dict(color="#f8d35e", width=1.6)), row=cur_row, col=1)
+        fig.add_trace(go.Scatter(
+            x=df["ts"], y=dea, mode="lines", name="DEA",
+            line=dict(color="#62c2ff", width=1.6)), row=cur_row, col=1)
+        # 零轴参考线（用 add_shape 安全，不触发 Indicator 子图检查）
+        yref_tag = "y" if cur_row == 1 else f"y{cur_row}"
+        fig.add_shape(type="line", xref="paper", yref=yref_tag,
+                      x0=0, x1=1, y0=0, y1=0,
+                      line=dict(color="rgba(255,255,255,0.18)", width=1, dash="dot"))
+        cur_row += 1
+
+    # ── ATR ───────────────────────────────────────────────────────────────
+    if show_atr and len(df) >= 14:
+        atr = calc_atr(df["h"], df["l"], df["c"])
+        fig.add_trace(go.Scatter(
+            x=df["ts"], y=atr, mode="lines", name="ATR(14)",
+            line=dict(color="#ffa94d", width=1.8),
+            fill="tozeroy", fillcolor="rgba(255,169,77,0.10)"), row=cur_row, col=1)
+        atr_mean = atr.mean()
+        if not pd.isna(atr_mean):
+            yref_tag2 = "y" if cur_row == 1 else f"y{cur_row}"
+            fig.add_shape(type="line", xref="paper", yref=yref_tag2,
+                          x0=0, x1=1, y0=float(atr_mean), y1=float(atr_mean),
+                          line=dict(color="rgba(255,165,0,0.45)", width=1, dash="dash"))
+
+    chart_h = 180 * n_rows
+    fig.update_layout(
+        height=chart_h, barmode="relative",
+        paper_bgcolor=_CHART_BG, plot_bgcolor=_PLOT_BG,
+        font=_FONT, margin=dict(l=12, r=12, t=36, b=12),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02,
+                    xanchor="right", x=1.0, font=dict(size=10)),
+        transition=dict(duration=260, easing="cubic-in-out"),
+    )
+    fig.update_xaxes(showgrid=False, zeroline=False)
+    fig.update_yaxes(showgrid=True, gridcolor=_GRID_COL, side="right")
+    return fig
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# v8 — 六方向图表函数
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ── 方向1：合约情绪真值视图 ───────────────────────────────────────────────────
+
+def build_contract_sentiment_figure(
+    sentiment_history: list,
+) -> go.Figure:
+    """
+    合约情绪真值层图表 — 4条线 + Bybit Taker
+    严格区分已确认 vs 未确认数据源
+    """
+    fig = make_subplots(
+        rows=3, cols=1, shared_xaxes=True,
+        vertical_spacing=0.04,
+        row_heights=[0.40, 0.30, 0.30],
+        subplot_titles=["Binance 多空比（已确认）", "Taker 买卖比", "持仓 vs 账户 多空比"],
+    )
+
+    if not sentiment_history:
+        fig.add_annotation(text="等待合约情绪数据…", showarrow=False,
+                           x=0.5, y=0.5, xref="paper", yref="paper",
+                           font=dict(color="#aac", size=14))
+        fig.update_layout(height=500, paper_bgcolor=_CHART_BG, plot_bgcolor=_PLOT_BG,
+                          font=_FONT, margin=_MARGIN)
+        return fig
+
+    ts = [pd.to_datetime(p.timestamp_ms, unit="ms") for p in sentiment_history]
+
+    # Row 1: 全市场账户多空比
+    g_ratio = [p.binance_global_ratio for p in sentiment_history]
+    top_acc  = [p.binance_top_account_ratio for p in sentiment_history]
+    top_pos  = [p.binance_top_position_ratio for p in sentiment_history]
+
+    for vals, name, color in [
+        (g_ratio, "全市场账户 (Global)", "#62c2ff"),
+        (top_acc,  "大户账户 (Top Acc)", "#a8ff78"),
+        (top_pos,  "大户持仓 (Top Pos)", "#f8d35e"),
+    ]:
+        if any(v is not None for v in vals):
+            fig.add_trace(go.Scatter(
+                x=ts, y=vals, mode="lines", name=name,
+                line=dict(color=color, width=1.8),
+                connectgaps=True), row=1, col=1)
+
+    # 多空平衡线
+    fig.add_hline(y=1.0, line_color="rgba(255,255,255,0.25)",
+                  line_dash="dash", line_width=1, row=1, col=1)
+
+    # Row 2: Taker买卖比
+    taker_b = [p.binance_taker_buy_ratio for p in sentiment_history]
+    bybit_b  = [p.bybit_taker_buy_ratio  for p in sentiment_history]
+
+    if any(v is not None for v in taker_b):
+        fig.add_trace(go.Scatter(
+            x=ts, y=taker_b, mode="lines", name="Binance Taker买比",
+            line=dict(color="#f0b90b", width=1.8), connectgaps=True), row=2, col=1)
+    if any(v is not None for v in bybit_b):
+        fig.add_trace(go.Scatter(
+            x=ts, y=bybit_b, mode="lines", name="Bybit Taker买比",
+            line=dict(color="#e6a817", width=1.8, dash="dot"), connectgaps=True), row=2, col=1)
+    fig.add_hline(y=0.5, line_color="rgba(255,255,255,0.25)",
+                  line_dash="dash", line_width=1, row=2, col=1)
+
+    # Row 3: 长多空比趋势对比
+    if any(v is not None for v in g_ratio):
+        fig.add_trace(go.Scatter(
+            x=ts, y=g_ratio, mode="lines", name="全市场账户",
+            line=dict(color="#62c2ff", width=1.4), connectgaps=True,
+            showlegend=False), row=3, col=1)
+    if any(v is not None for v in top_pos):
+        fig.add_trace(go.Scatter(
+            x=ts, y=top_pos, mode="lines", name="大户持仓",
+            line=dict(color="#f8d35e", width=1.4), connectgaps=True,
+            showlegend=False), row=3, col=1)
+    fig.add_hline(y=1.0, line_color="rgba(255,255,255,0.25)",
+                  line_dash="dash", line_width=1, row=3, col=1)
+
+    fig.update_layout(
+        height=540, paper_bgcolor=_CHART_BG, plot_bgcolor=_PLOT_BG,
+        font=_FONT, margin=_MARGIN,
+        title=dict(text="📊 合约情绪真值层  ·  Contract Sentiment Truth",
+                   x=0.02, font=dict(size=15, color="#f3f8ff")),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02,
+                    xanchor="right", x=1.0, font=dict(size=10)),
+    )
+    fig.update_xaxes(showgrid=False, zeroline=False)
+    fig.update_yaxes(showgrid=True, gridcolor=_GRID_COL)
+    return fig
+
+
+def build_sentiment_gauge_html(pt) -> str:
+    """
+    合约情绪仪表盘 HTML — 显示4个确认数据源状态
+    """
+    if pt is None:
+        return '<div style="color:#aac;padding:12px;">等待情绪数据…</div>'
+
+    def _bar(val, label, color, note="已确认"):
+        if val is None:
+            return (
+                '<div style="margin:6px 0;padding:8px 12px;border-radius:10px;'
+                'border:1px solid rgba(255,255,255,0.08);background:rgba(255,255,255,0.04);">'
+                '<span style="color:#666;font-size:0.8rem;">{label} — 暂无数据</span>'
+                '</div>'
+            ).format(label=label)
+
+        if isinstance(val, float) and val <= 2.0:
+            # ratio形式，转为pct
+            long_pct = val / (1 + val) * 100 if val > 0 else 50.0
+        else:
+            long_pct = float(val) * 100  # 已是比例
+        short_pct = 100 - long_pct
+
+        bg_l = "#1dc796" if long_pct > 55 else "#ff6868" if long_pct < 45 else "#62c2ff"
+        bg_s = "#ff6868" if long_pct > 55 else "#1dc796" if long_pct < 45 else "#ffa94d"
+
+        return (
+            '<div style="margin:6px 0;padding:10px 12px;border-radius:12px;'
+            'border:1px solid rgba(255,255,255,0.12);background:rgba(255,255,255,0.06);">'
+            '<div style="display:flex;justify-content:space-between;margin-bottom:4px;">'
+            '<span style="font-size:0.78rem;color:#bcd;">{label}</span>'
+            '<span style="font-size:0.7rem;color:#5a9;background:rgba(90,200,90,0.12);'
+            'padding:1px 6px;border-radius:6px;">✓ {note}</span>'
+            '</div>'
+            '<div style="display:flex;width:100%;height:10px;border-radius:5px;overflow:hidden;">'
+            '<div style="width:{lp:.1f}%;background:{bl};transition:width 0.5s;"></div>'
+            '<div style="width:{sp:.1f}%;background:{bs};transition:width 0.5s;"></div>'
+            '</div>'
+            '<div style="display:flex;justify-content:space-between;margin-top:3px;">'
+            '<span style="color:{bl};font-size:0.82rem;font-weight:700;">多 {lp:.1f}%</span>'
+            '<span style="color:{bs};font-size:0.82rem;font-weight:700;">空 {sp:.1f}%</span>'
+            '</div></div>'
+        ).format(label=label, note=note, lp=long_pct, sp=short_pct, bl=bg_l, bs=bg_s)
+
+    parts = [
+        _bar(pt.binance_global_ratio, "Binance 全市场账户", "#62c2ff", "已确认"),
+        _bar(pt.binance_top_account_ratio, "Binance 大户账户", "#a8ff78", "已确认"),
+        _bar(pt.binance_top_position_ratio, "Binance 大户持仓", "#f8d35e", "已确认"),
+    ]
+
+    # Taker 买卖比
+    if pt.binance_taker_buy_ratio is not None:
+        btr = pt.binance_taker_buy_ratio * 100
+        bg = "#1dc796" if btr > 52 else "#ff6868" if btr < 48 else "#62c2ff"
+        parts.append(
+            '<div style="margin:6px 0;padding:10px 12px;border-radius:12px;'
+            'border:1px solid rgba(255,255,255,0.12);background:rgba(255,255,255,0.06);">'
+            '<div style="display:flex;justify-content:space-between;margin-bottom:4px;">'
+            '<span style="font-size:0.78rem;color:#bcd;">Binance Taker买比</span>'
+            '<span style="font-size:0.7rem;color:#5a9;background:rgba(90,200,90,0.12);'
+            'padding:1px 6px;border-radius:6px;">✓ 已确认</span>'
+            '</div>'
+            '<div style="font-size:1.2rem;font-weight:800;color:{bg};">{btr:.1f}%</div>'
+            '</div>'.format(bg=bg, btr=btr)
+        )
+
+    if pt.bybit_taker_buy_ratio is not None:
+        bbr = pt.bybit_taker_buy_ratio * 100
+        bg = "#e6a817" if bbr > 50 else "#ffa94d"
+        parts.append(
+            '<div style="margin:6px 0;padding:10px 12px;border-radius:12px;'
+            'border:1px solid rgba(255,255,255,0.12);background:rgba(255,255,255,0.06);">'
+            '<div style="display:flex;justify-content:space-between;margin-bottom:4px;">'
+            '<span style="font-size:0.78rem;color:#bcd;">Bybit Taker买比（非持仓）</span>'
+            '<span style="font-size:0.7rem;color:#5a9;background:rgba(90,200,90,0.12);'
+            'padding:1px 6px;border-radius:6px;">✓ 已确认</span>'
+            '</div>'
+            '<div style="font-size:1.2rem;font-weight:800;color:{bg};">{bbr:.1f}%</div>'
+            '</div>'.format(bg=bg, bbr=bbr)
+        )
+
+    # OKX 标"暂不支持"
+    parts.append(
+        '<div style="margin:6px 0;padding:8px 12px;border-radius:10px;'
+        'border:1px solid rgba(255,165,0,0.25);background:rgba(255,165,0,0.05);">'
+        '<span style="color:#888;font-size:0.8rem;">OKX 全市场多空比 — '
+        '<span style="color:#ffa94d;">暂不支持</span></span>'
+        '</div>'
+    )
+    parts.append(
+        '<div style="margin:6px 0;padding:8px 12px;border-radius:10px;'
+        'border:1px solid rgba(100,150,200,0.2);background:rgba(100,150,200,0.04);">'
+        '<span style="color:#888;font-size:0.8rem;">Hyperliquid — '
+        '<span style="color:#62c2ff;">无全市场数据</span></span>'
+        '</div>'
+    )
+
+    return (
+        '<div style="padding:14px;border-radius:16px;border:1px solid rgba(255,255,255,0.13);'
+        'background:rgba(255,255,255,0.05);backdrop-filter:blur(20px);">'
+        '<div style="font-size:0.72rem;color:#bcd;text-transform:uppercase;'
+        'letter-spacing:0.14em;margin-bottom:8px;">合约情绪真值</div>'
+        + "".join(parts) +
+        '</div>'
+    )
+
+
+# ── 方向2：现货合约分账 UI 辅助函数 ──────────────────────────────────────────
+
+def build_spot_flow_figure(spot_history: list) -> go.Figure:
+    """现货流视图图表 — 无多空比，只显示 Taker 买卖 / 盘口"""
+    fig = make_subplots(rows=2, cols=1, shared_xaxes=True,
+                        vertical_spacing=0.04, row_heights=[0.6, 0.4])
+
+    if not spot_history:
+        fig.add_annotation(text="等待现货流数据…", showarrow=False,
+                           x=0.5, y=0.5, xref="paper", yref="paper",
+                           font=dict(color="#aac", size=14))
+        fig.update_layout(height=380, paper_bgcolor=_CHART_BG, plot_bgcolor=_PLOT_BG,
+                          font=_FONT, margin=_MARGIN)
+        return fig
+
+    ts = [pd.to_datetime(p.timestamp_ms, unit="ms") for p in spot_history]
+    buy_ratio = [p.taker_buy_ratio for p in spot_history]
+    imbalance = [p.ob_imbalance_pct for p in spot_history]
+    spread    = [p.spread_bps for p in spot_history]
+
+    # Row 1: Taker 买比
+    if any(v is not None for v in buy_ratio):
+        fig.add_trace(go.Scatter(
+            x=ts, y=buy_ratio, mode="lines", name="现货Taker买比",
+            line=dict(color="#a8ff78", width=2),
+            fill="tozeroy", fillcolor="rgba(168,255,120,0.08)"), row=1, col=1)
+    fig.add_hline(y=0.5, line_color="rgba(255,255,255,0.2)",
+                  line_dash="dash", row=1, col=1)
+
+    # Row 2: 盘口失衡
+    if any(v is not None for v in imbalance):
+        colors = ["#1dc796" if (v or 0) > 0 else "#ff6868" for v in imbalance]
+        fig.add_trace(go.Bar(
+            x=ts, y=imbalance, name="盘口失衡%",
+            marker_color=colors, opacity=0.75), row=2, col=1)
+
+    fig.update_layout(
+        height=380, paper_bgcolor=_CHART_BG, plot_bgcolor=_PLOT_BG,
+        font=_FONT, margin=_MARGIN,
+        title=dict(text="📦 现货流视图  ·  Spot Flow (无多空比)",
+                   x=0.02, font=dict(size=14, color="#f3f8ff")),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1.0),
+    )
+    fig.update_xaxes(showgrid=False)
+    fig.update_yaxes(showgrid=True, gridcolor=_GRID_COL)
+    return fig
+
+
+def build_perp_flow_figure(perp_history: list) -> go.Figure:
+    """合约流视图图表 — 含多空比，仅合约视角显示"""
+    fig = make_subplots(rows=3, cols=1, shared_xaxes=True,
+                        vertical_spacing=0.04, row_heights=[0.35, 0.35, 0.30])
+
+    if not perp_history:
+        fig.add_annotation(text="等待合约流数据…", showarrow=False,
+                           x=0.5, y=0.5, xref="paper", yref="paper",
+                           font=dict(color="#aac", size=14))
+        fig.update_layout(height=480, paper_bgcolor=_CHART_BG, plot_bgcolor=_PLOT_BG,
+                          font=_FONT, margin=_MARGIN)
+        return fig
+
+    ts = [pd.to_datetime(p.timestamp_ms, unit="ms") for p in perp_history]
+
+    # Row 1: 多空比（仅合约）
+    ls_ratio = [p.long_short_ratio for p in perp_history]
+    if any(v is not None for v in ls_ratio):
+        fig.add_trace(go.Scatter(
+            x=ts, y=ls_ratio, mode="lines", name="多空比(合约)",
+            line=dict(color="#62c2ff", width=2)), row=1, col=1)
+    fig.add_hline(y=1.0, line_color="rgba(255,255,255,0.25)",
+                  line_dash="dash", row=1, col=1)
+
+    # Row 2: Taker 买卖比
+    buy_ratio = [p.taker_buy_ratio for p in perp_history]
+    if any(v is not None for v in buy_ratio):
+        fig.add_trace(go.Scatter(
+            x=ts, y=buy_ratio, mode="lines", name="合约Taker买比",
+            line=dict(color="#f8d35e", width=2),
+            fill="tozeroy", fillcolor="rgba(248,211,94,0.08)"), row=2, col=1)
+    fig.add_hline(y=0.5, line_color="rgba(255,255,255,0.2)",
+                  line_dash="dash", row=2, col=1)
+
+    # Row 3: OI变化
+    oi_delta = [p.oi_delta for p in perp_history]
+    if any(v is not None for v in oi_delta):
+        colors = ["#1dc796" if (v or 0) > 0 else "#ff6868" for v in oi_delta]
+        fig.add_trace(go.Bar(
+            x=ts, y=oi_delta, name="OI变化",
+            marker_color=colors, opacity=0.75), row=3, col=1)
+
+    fig.update_layout(
+        height=480, paper_bgcolor=_CHART_BG, plot_bgcolor=_PLOT_BG,
+        font=_FONT, margin=_MARGIN,
+        title=dict(text="📊 合约流视图  ·  Perp Flow (含多空比)",
+                   x=0.02, font=dict(size=14, color="#f3f8ff")),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1.0),
+    )
+    fig.update_xaxes(showgrid=False)
+    fig.update_yaxes(showgrid=True, gridcolor=_GRID_COL)
+    return fig
+
+
+def build_combined_flow_figure(combined_history: list) -> go.Figure:
+    """联合视图 — 现货+合约对照图"""
+    fig = make_subplots(rows=2, cols=2, shared_xaxes=True,
+                        vertical_spacing=0.06, horizontal_spacing=0.06,
+                        subplot_titles=["现货Taker买比", "合约Taker买比",
+                                        "现货盘口失衡", "现货-合约价差(bps)"])
+
+    if not combined_history:
+        fig.add_annotation(text="等待联合流数据…", showarrow=False,
+                           x=0.5, y=0.5, xref="paper", yref="paper",
+                           font=dict(color="#aac", size=14))
+        fig.update_layout(height=420, paper_bgcolor=_CHART_BG, plot_bgcolor=_PLOT_BG,
+                          font=_FONT, margin=_MARGIN)
+        return fig
+
+    ts = [pd.to_datetime(c.timestamp_ms, unit="ms") for c in combined_history]
+
+    spot_buy = [c.spot.taker_buy_ratio if c.spot else None for c in combined_history]
+    perp_buy = [c.perp.taker_buy_ratio if c.perp else None for c in combined_history]
+    spot_imb = [c.spot.ob_imbalance_pct if c.spot else None for c in combined_history]
+    spread   = [c.spot_perp_spread_bps for c in combined_history]
+
+    for row, col, vals, name, color, fill in [
+        (1, 1, spot_buy, "现货买比", "#a8ff78", "rgba(168,255,120,0.08)"),
+        (1, 2, perp_buy, "合约买比", "#62c2ff", "rgba(98,194,255,0.08)"),
+    ]:
+        if any(v is not None for v in vals):
+            fig.add_trace(go.Scatter(
+                x=ts, y=vals, mode="lines", name=name,
+                line=dict(color=color, width=1.8),
+                fill="tozeroy", fillcolor=fill), row=row, col=col)
+
+    if any(v is not None for v in spot_imb):
+        colors = ["#1dc796" if (v or 0) > 0 else "#ff6868" for v in spot_imb]
+        fig.add_trace(go.Bar(x=ts, y=spot_imb, name="盘口失衡",
+                             marker_color=colors, opacity=0.7), row=2, col=1)
+
+    if any(v is not None for v in spread):
+        colors = ["#1dc796" if (v or 0) > 0 else "#ff6868" for v in spread]
+        fig.add_trace(go.Bar(x=ts, y=spread, name="现货-合约价差",
+                             marker_color=colors, opacity=0.7), row=2, col=2)
+
+    fig.update_layout(
+        height=420, paper_bgcolor=_CHART_BG, plot_bgcolor=_PLOT_BG,
+        font=_FONT, margin=_MARGIN,
+        title=dict(text="🔗 联合视图  ·  Combined Flow View",
+                   x=0.02, font=dict(size=14, color="#f3f8ff")),
+        showlegend=False,
+    )
+    fig.update_xaxes(showgrid=False)
+    fig.update_yaxes(showgrid=True, gridcolor=_GRID_COL)
+    return fig
+
+
+# ── 方向3：清算热力图2.0（置信度分级渲染）────────────────────────────────────
+
+def build_liq_confidence_heatmap(
+    events_with_conf: list,
+    ref_price: Optional[float] = None,
+    title: str = "清算热力图 2.0 · 置信度分级",
+) -> go.Figure:
+    """
+    清算热力图 2.0 — 透明度 = 置信度，散点形状 = 数据来源
+    Bybit WS=1.0实心圆 / Binance WS=0.5空心圆 / OKX REST=0.3菱形 / HL=0.2×
+    """
+    fig = go.Figure()
+
+    if not events_with_conf:
+        fig.add_annotation(text="暂无清算数据", showarrow=False,
+                           x=0.5, y=0.5, xref="paper", yref="paper",
+                           font=dict(color="#aac", size=14))
+        fig.update_layout(height=400, paper_bgcolor=_CHART_BG, plot_bgcolor=_PLOT_BG,
+                          font=_FONT, margin=_MARGIN)
+        return fig
+
+    # 按置信度分组渲染
+    conf_groups = {
+        "真实(Bybit WS)":   {"symbol": "circle",      "items": []},
+        "可能漏单(BN WS)":   {"symbol": "circle-open", "items": []},
+        "仅参考(OKX REST)":  {"symbol": "diamond",     "items": []},
+        "推断(HL)":          {"symbol": "x",           "items": []},
+    }
+
+    for ewc in events_with_conf:
+        ev = ewc.base_event
+        label = ewc.confidence_label
+        grp_key = label if label in conf_groups else "可能漏单(BN WS)"
+        conf_groups[grp_key]["items"].append(ewc)
+
+    for grp_label, grp_data in conf_groups.items():
+        items = grp_data["items"]
+        if not items:
+            continue
+        xs = [pd.to_datetime(i.base_event.timestamp_ms, unit="ms") for i in items]
+        ys = [i.base_event.price for i in items]
+        sizes = [max(6, min(28, (i.base_event.notional or 10_000) / 30_000)) for i in items]
+        opacities = [i.render_opacity for i in items]
+        colors = [i.render_color for i in items]
+        # Plotly doesn't support per-marker opacity in scatter — use fixed opacity at 80% conf
+        opacity = max(0.15, sum(opacities) / len(opacities)) if opacities else 0.5
+
+        sides = [i.base_event.side for i in items]
+        text = [
+            f"{i.base_event.exchange} | {s} | {i.confidence_label}<br>"
+            f"价格: {i.base_event.price:.2f} | 金额: ${(i.base_event.notional or 0)/1e6:.2f}M<br>"
+            f"置信度: {i.confidence:.1f}"
+            for i, s in zip(items, sides)
+        ]
+
+        fig.add_trace(go.Scatter(
+            x=xs, y=ys,
+            mode="markers",
+            name=grp_label,
+            marker=dict(
+                symbol=grp_data["symbol"],
+                size=sizes,
+                color=colors,
+                opacity=opacity,
+                line=dict(width=1, color="rgba(255,255,255,0.3)"),
+            ),
+            text=text,
+            hovertemplate="%{text}<extra></extra>",
+        ))
+
+    # 当前价格参考线
+    if ref_price:
+        fig.add_hline(y=ref_price, line_color="#f8d35e",
+                      line_dash="dot", line_width=1.5,
+                      annotation_text=f"当前 {ref_price:.2f}",
+                      annotation_font_color="#f8d35e")
+
+    # 置信度图例注释
+    fig.add_annotation(
+        x=0.01, y=0.99, xref="paper", yref="paper", xanchor="left", yanchor="top",
+        text=(
+            "<b>置信度分级</b><br>"
+            "● 实心圆 Bybit WS = 1.0 真实<br>"
+            "○ 空心圆 Binance WS = 0.5 可能漏单<br>"
+            "◆ 菱形 OKX REST = 0.3 仅参考<br>"
+            "✕ × HL = 0.2 推断"
+        ),
+        showarrow=False,
+        bgcolor="rgba(14,22,35,0.7)",
+        bordercolor="rgba(255,255,255,0.15)",
+        borderwidth=1,
+        font=dict(size=10, color="#dce8f6"),
+        align="left",
+    )
+
+    fig.update_layout(
+        height=480, paper_bgcolor=_CHART_BG, plot_bgcolor=_PLOT_BG,
+        font=_FONT, margin=_MARGIN,
+        title=dict(text=title, x=0.02, font=dict(size=15, color="#f3f8ff")),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02,
+                    xanchor="right", x=1.0, font=dict(size=10)),
+    )
+    fig.update_xaxes(showgrid=False)
+    fig.update_yaxes(showgrid=True, gridcolor=_GRID_COL, tickformat=".2f")
+    return fig
+
+
+# ── 方向4：鲸鱼热力图三视角 ─────────────────────────────────────────────────
+
+def build_whale_heatmap_figure(
+    spot_flows: list,
+    perp_flows: list,
+    ref_price: Optional[float] = None,
+    view: str = "spot",   # "spot" / "perp" / "combined"
+    split_clusters: Optional[list] = None,
+) -> go.Figure:
+    """
+    鲸鱼热力图 — 三视角：现货/合约/对照图
+    拆单检测（30s内同价位±0.1%连续≥3笔标记为橙色圆环）
+    现货和合约 large_order_flow 分别存储不混用
+    """
+    fig = go.Figure()
+
+    def _add_flow_trace(flows, name_prefix, buy_color, sell_color, symbol="circle"):
+        if not flows:
+            return
+        buy_f  = [f for f in flows if f.side == "buy"]
+        sell_f = [f for f in flows if f.side == "sell"]
+        for side_flows, color, side_name in [
+            (buy_f, buy_color, "买"),
+            (sell_f, sell_color, "卖"),
+        ]:
+            if not side_flows:
+                continue
+            xs    = [pd.to_datetime(f.timestamp_ms, unit="ms") for f in side_flows]
+            ys    = [f.price for f in side_flows]
+            sizes = [max(6, min(40, (f.notional or 10_000) / 20_000)) for f in side_flows]
+            text  = [
+                f"{f.exchange} | {side_name}单<br>"
+                f"价格: {f.price:.2f} | 金额: ${(f.notional or 0)/1e6:.2f}M"
+                + ("<br>⚠️ 疑似拆单" if getattr(f, "is_split_order", False) else "")
+                for f in side_flows
+            ]
+            fig.add_trace(go.Scatter(
+                x=xs, y=ys, mode="markers",
+                name=f"{name_prefix} {side_name}",
+                marker=dict(symbol=symbol, size=sizes, color=color,
+                            opacity=0.75, line=dict(width=1, color="rgba(255,255,255,0.2)")),
+                text=text, hovertemplate="%{text}<extra></extra>",
+            ))
+
+    if view == "spot":
+        _add_flow_trace(spot_flows, "现货", "#a8ff78", "#ff9a9a", symbol="circle")
+    elif view == "perp":
+        _add_flow_trace(perp_flows, "合约", "#62c2ff", "#ff6868", symbol="diamond")
+    else:  # combined
+        _add_flow_trace(spot_flows, "现货", "#a8ff78", "#ff9a9a", symbol="circle")
+        _add_flow_trace(perp_flows, "合约", "#62c2ff", "#ff6868", symbol="diamond-open")
+
+    # 拆单簇标记（橙色圆环）
+    if split_clusters:
+        for cluster in split_clusters:
+            mid_ts = pd.to_datetime(
+                int((cluster.first_ms + cluster.last_ms) / 2), unit="ms")
+            fig.add_trace(go.Scatter(
+                x=[mid_ts], y=[cluster.price_center],
+                mode="markers+text",
+                name=f"拆单{cluster.order_count}笔",
+                marker=dict(symbol="circle-open", size=32,
+                            color="rgba(255,165,0,0.0)",
+                            line=dict(width=3, color="#ffa94d")),
+                text=[f"拆{cluster.order_count}"],
+                textposition="top center",
+                textfont=dict(color="#ffa94d", size=10),
+                hovertemplate=(
+                    f"⚠️ 疑似拆单<br>笔数: {cluster.order_count}<br>"
+                    f"总金额: ${cluster.total_notional/1e6:.2f}M<br>"
+                    f"持续: {(cluster.last_ms-cluster.first_ms)/1000:.0f}s"
+                    "<extra></extra>"
+                ),
+                showlegend=False,
+            ))
+
+    if ref_price:
+        fig.add_hline(y=ref_price, line_color="#f8d35e",
+                      line_dash="dot", line_width=1.5)
+
+    view_labels = {"spot": "现货视角", "perp": "合约视角", "combined": "对照图"}
+    fig.update_layout(
+        height=460, paper_bgcolor=_CHART_BG, plot_bgcolor=_PLOT_BG,
+        font=_FONT, margin=_MARGIN,
+        title=dict(
+            text=f"🐋 鲸鱼热力图  ·  {view_labels.get(view, view)}",
+            x=0.02, font=dict(size=15, color="#f3f8ff")),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02,
+                    xanchor="right", x=1.0, font=dict(size=10)),
+    )
+    fig.update_xaxes(showgrid=False)
+    fig.update_yaxes(showgrid=True, gridcolor=_GRID_COL, tickformat=".2f")
+    return fig
+
+
+# ── 方向6：六维风险雷达图 ────────────────────────────────────────────────────
+
+def build_risk_radar_figure(risk_pt) -> go.Figure:
+    """
+    六维风险雷达图 — 整合 Funding/基差/OI/清算/ADL/HL独占
+    Hyperliquid 三独占维度用特殊注释高亮
+    """
+    fig = go.Figure()
+
+    if risk_pt is None:
+        fig.add_annotation(text="等待风险数据…", showarrow=False,
+                           x=0.5, y=0.5, xref="paper", yref="paper",
+                           font=dict(color="#aac", size=14))
+        fig.update_layout(height=420, paper_bgcolor=_CHART_BG,
+                          plot_bgcolor=_PLOT_BG, font=_FONT, margin=_MARGIN)
+        return fig
+
+    dims = [
+        "Funding\n机制",
+        "基差\n机制",
+        "OI\n压力",
+        "清算\n密度",
+        "ADL\n保险基金",
+        "HL资产\nCtx ⭐",  # HL独占维度
+    ]
+    vals = [
+        max(0, risk_pt.funding_risk),
+        max(0, risk_pt.basis_risk),
+        max(0, risk_pt.oi_pressure),
+        max(0, risk_pt.liq_density),
+        max(0, risk_pt.adl_insurance_risk),
+        max(0, risk_pt.hl_asset_ctx_risk),
+    ]
+    # 首尾闭合
+    dims_closed = dims + [dims[0]]
+    vals_closed = vals + [vals[0]]
+
+    # 背景参考区（低/中/高风险带）
+    for level, color, name in [
+        (0.3, "rgba(29,199,150,0.06)", "低风险"),
+        (0.6, "rgba(255,165,0,0.06)",  "中风险"),
+        (1.0, "rgba(255,68,68,0.06)",  "高风险"),
+    ]:
+        bg = [level] * len(dims_closed)
+        fig.add_trace(go.Scatterpolar(
+            r=bg, theta=dims_closed, fill="toself",
+            fillcolor=color, line=dict(width=0),
+            name=name, opacity=1.0,
+            hoverinfo="skip",
+        ))
+
+    # 主雷达
+    risk_color = risk_pt.risk_color
+    fig.add_trace(go.Scatterpolar(
+        r=vals_closed, theta=dims_closed,
+        fill="toself",
+        fillcolor=f"rgba({','.join(str(int(c, 16)) for c in [risk_color[1:3], risk_color[3:5], risk_color[5:7]])},0.25)" if len(risk_color) == 7 else "rgba(98,194,255,0.2)",
+        line=dict(color=risk_color, width=2.5),
+        name=f"综合风险 {risk_pt.risk_label}",
+        mode="lines+markers",
+        marker=dict(size=7, color=risk_color),
+        hovertemplate="<b>%{theta}</b><br>风险值: %{r:.3f}<extra></extra>",
+    ))
+
+    # HL 独占维度注释
+    hl_annots = []
+    if risk_pt.hl_predicted_funding_bps is not None:
+        hl_annots.append(f"预测费率: {risk_pt.hl_predicted_funding_bps:+.2f}bps")
+    if risk_pt.hl_perps_at_oi_cap is not None:
+        cap_str = "⚠️ 已触碰OI上限" if risk_pt.hl_perps_at_oi_cap else "OI未触上限"
+        hl_annots.append(cap_str)
+    if risk_pt.hl_mark_oracle_deviation_pct is not None:
+        hl_annots.append(f"Mark/Oracle偏差: {risk_pt.hl_mark_oracle_deviation_pct:.3f}%")
+
+    hl_text = "<br>".join(hl_annots) if hl_annots else "HL数据获取中…"
+
+    fig.update_layout(
+        height=480,
+        paper_bgcolor=_CHART_BG,
+        plot_bgcolor=_PLOT_BG,
+        font=_FONT,
+        margin=dict(l=40, r=40, t=80, b=40),
+        polar=dict(
+            bgcolor="rgba(255,255,255,0.03)",
+            radialaxis=dict(
+                visible=True, range=[0, 1],
+                tickfont=dict(size=9, color="#889"),
+                gridcolor="rgba(255,255,255,0.1)",
+                linecolor="rgba(255,255,255,0.1)",
+            ),
+            angularaxis=dict(
+                tickfont=dict(size=11, color="#dce8f6", family="SF Pro Display, Segoe UI"),
+                linecolor="rgba(255,255,255,0.15)",
+                gridcolor="rgba(255,255,255,0.08)",
+            ),
+        ),
+        legend=dict(orientation="h", yanchor="bottom", y=-0.12,
+                    xanchor="center", x=0.5, font=dict(size=10)),
+        title=dict(
+            text=(
+                f"⚡ 六维风险板  ·  {risk_pt.coin}  "
+                f"<span style='color:{risk_pt.risk_color}'>{risk_pt.risk_label}</span>  "
+                f"({risk_pt.composite_risk:+.3f})"
+            ),
+            x=0.02, font=dict(size=14, color="#f3f8ff"),
+        ),
+    )
+
+    # HL 独占信息注释框
+    fig.add_annotation(
+        x=1.02, y=1.0, xref="paper", yref="paper",
+        xanchor="left", yanchor="top",
+        text="<b>⭐ HL 独占维度</b><br>" + hl_text,
+        showarrow=False,
+        bgcolor="rgba(14,22,35,0.75)",
+        bordercolor="rgba(98,194,255,0.4)",
+        borderwidth=1,
+        font=dict(size=10, color="#dce8f6"),
+        align="left",
+    )
+    return fig
+
+
+def build_risk_history_figure(risk_history: list) -> go.Figure:
+    """风险板历史趋势 — 六维折线图"""
+    fig = make_subplots(rows=2, cols=1, shared_xaxes=True,
+                        vertical_spacing=0.05, row_heights=[0.55, 0.45])
+
+    if not risk_history:
+        fig.add_annotation(text="等待风险历史数据…", showarrow=False,
+                           x=0.5, y=0.5, xref="paper", yref="paper",
+                           font=dict(color="#aac", size=14))
+        fig.update_layout(height=400, paper_bgcolor=_CHART_BG,
+                          plot_bgcolor=_PLOT_BG, font=_FONT, margin=_MARGIN)
+        return fig
+
+    ts = [pd.to_datetime(p.timestamp_ms, unit="ms") for p in risk_history]
+
+    # Row 1: 各维度
+    dims_cfg = [
+        ("funding_risk",      "Funding风险",  "#f0b90b"),
+        ("basis_risk",        "基差风险",     "#ffa94d"),
+        ("oi_pressure",       "OI压力",       "#62c2ff"),
+        ("liq_density",       "清算密度",     "#ff6868"),
+        ("adl_insurance_risk","ADL风险",      "#c084fc"),
+        ("hl_asset_ctx_risk", "HL Ctx⭐",     "#a8ff78"),
+    ]
+    for attr, name, color in dims_cfg:
+        vals = [getattr(p, attr, 0) for p in risk_history]
+        fig.add_trace(go.Scatter(
+            x=ts, y=vals, mode="lines", name=name,
+            line=dict(color=color, width=1.5)), row=1, col=1)
+
+    # Row 2: 综合得分
+    composite = [p.composite_risk for p in risk_history]
+    colors = [p.risk_color for p in risk_history]
+    fig.add_trace(go.Scatter(
+        x=ts, y=composite, mode="lines",
+        name="综合风险",
+        line=dict(color="#fff", width=2.5),
+        fill="tozeroy",
+        fillcolor="rgba(255,255,255,0.05)"), row=2, col=1)
+    fig.add_hline(y=0.3, line_color="rgba(255,165,0,0.4)",
+                  line_dash="dash", row=2, col=1)
+    fig.add_hline(y=0.6, line_color="rgba(255,68,68,0.4)",
+                  line_dash="dash", row=2, col=1)
+    fig.add_hline(y=0.0, line_color="rgba(255,255,255,0.15)",
+                  line_dash="dot", row=2, col=1)
+
+    fig.update_layout(
+        height=440, paper_bgcolor=_CHART_BG, plot_bgcolor=_PLOT_BG,
+        font=_FONT, margin=_MARGIN,
+        title=dict(text="📉 风险历史趋势  ·  Risk History",
+                   x=0.02, font=dict(size=14, color="#f3f8ff")),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02,
+                    xanchor="right", x=1.0, font=dict(size=10)),
+    )
+    fig.update_xaxes(showgrid=False)
+    fig.update_yaxes(showgrid=True, gridcolor=_GRID_COL)
+    return fig

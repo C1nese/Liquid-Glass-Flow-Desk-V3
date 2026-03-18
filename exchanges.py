@@ -967,3 +967,330 @@ def fetch_aggregated_oi(coin: str, timeout: int = DEFAULT_TIMEOUT
             results[ek] = oi
 
     return results
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# v8 — 方向1：合约情绪真值层  (Binance 4端点并发 + Bybit Taker)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def fetch_contract_sentiment_point(
+    binance_symbol: str,
+    bybit_symbol: str,
+    interval: str = "5m",
+    timeout: int = DEFAULT_TIMEOUT,
+) -> "ContractSentimentPoint":
+    """
+    并发拉取 Binance 4 端点 + Bybit buyRatio，用 timestamp 对齐返回一个
+    ContractSentimentPoint。OKX 标"暂不支持"，HL 标"无全市场数据"。
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from models import ContractSentimentPoint
+    import time as _time
+
+    binance = BinanceClient(timeout)
+    bybit   = BybitClient(timeout)
+    period  = BINANCE_RATIO_PERIODS.get(interval, "5m")
+
+    results: Dict[str, Any] = {}
+
+    def _binance_global():
+        try:
+            data = binance._get("/futures/data/globalLongShortAccountRatio",
+                                {"symbol": binance_symbol, "period": period, "limit": 1})
+            return "binance_global", data[-1] if data else None
+        except Exception as e:
+            return "binance_global", None
+
+    def _binance_top_account():
+        try:
+            data = binance._get("/futures/data/topLongShortAccountRatio",
+                                {"symbol": binance_symbol, "period": period, "limit": 1})
+            return "binance_top_acc", data[-1] if data else None
+        except:
+            return "binance_top_acc", None
+
+    def _binance_top_position():
+        try:
+            data = binance._get("/futures/data/topLongShortPositionRatio",
+                                {"symbol": binance_symbol, "period": period, "limit": 1})
+            return "binance_top_pos", data[-1] if data else None
+        except:
+            return "binance_top_pos", None
+
+    def _binance_taker():
+        try:
+            data = binance._get("/futures/data/takerlongshortRatio",
+                                {"symbol": binance_symbol, "period": period, "limit": 1})
+            return "binance_taker", data[-1] if data else None
+        except:
+            return "binance_taker", None
+
+    def _bybit_taker():
+        try:
+            data = bybit._get("/v5/market/account-ratio",
+                              {"category": "linear", "symbol": bybit_symbol,
+                               "period": BINANCE_RATIO_PERIODS.get(interval, "5m"), "limit": 1})
+            items = data.get("result", {}).get("list", [])
+            return "bybit_taker", items[0] if items else None
+        except:
+            return "bybit_taker", None
+
+    tasks = [_binance_global, _binance_top_account, _binance_top_position,
+             _binance_taker, _bybit_taker]
+
+    with ThreadPoolExecutor(max_workers=5) as exe:
+        futs = [exe.submit(t) for t in tasks]
+        for fut in as_completed(futs):
+            try:
+                k, v = fut.result()
+                results[k] = v
+            except Exception:
+                pass
+
+    now_ms = int(_time.time() * 1000)
+    confirmed = []
+
+    # --- Binance global ---
+    g = results.get("binance_global") or {}
+    g_ratio = safe_float(g.get("longShortRatio"))
+    g_long_pct = g_ratio / (1 + g_ratio) * 100 if g_ratio else None
+    g_short_pct = (100 - g_long_pct) if g_long_pct is not None else None
+    if g_ratio is not None:
+        confirmed.append("binance_global_account")
+
+    # --- Binance top account ---
+    ta = results.get("binance_top_acc") or {}
+    ta_ratio = safe_float(ta.get("longShortRatio"))
+    ta_long_pct = ta_ratio / (1 + ta_ratio) * 100 if ta_ratio else None
+    ta_short_pct = (100 - ta_long_pct) if ta_long_pct is not None else None
+    if ta_ratio is not None:
+        confirmed.append("binance_top_account")
+
+    # --- Binance top position ---
+    tp = results.get("binance_top_pos") or {}
+    tp_ratio = safe_float(tp.get("longShortRatio"))
+    tp_long_pct = tp_ratio / (1 + tp_ratio) * 100 if tp_ratio else None
+    tp_short_pct = (100 - tp_long_pct) if tp_long_pct is not None else None
+    if tp_ratio is not None:
+        confirmed.append("binance_top_position")
+
+    # --- Binance taker ---
+    tk = results.get("binance_taker") or {}
+    tk_buy = safe_float(tk.get("buyVol"))
+    tk_sell = safe_float(tk.get("sellVol"))
+    tk_ratio = safe_float(tk.get("buySellRatio"))
+    tk_buy_pct = tk_buy / (tk_buy + tk_sell) if tk_buy and tk_sell and (tk_buy + tk_sell) > 0 else None
+    tk_sell_pct = (1 - tk_buy_pct) if tk_buy_pct is not None else None
+    if tk_ratio is not None:
+        confirmed.append("binance_taker")
+
+    # --- Bybit taker ---
+    byt = results.get("bybit_taker") or {}
+    byt_buy = safe_float(byt.get("buyRatio"))
+    if byt_buy is not None:
+        confirmed.append("bybit_taker")
+
+    return ContractSentimentPoint(
+        timestamp_ms=now_ms,
+        binance_global_long_pct=g_long_pct,
+        binance_global_short_pct=g_short_pct,
+        binance_global_ratio=g_ratio,
+        binance_top_account_long_pct=ta_long_pct,
+        binance_top_account_short_pct=ta_short_pct,
+        binance_top_account_ratio=ta_ratio,
+        binance_top_position_long_pct=tp_long_pct,
+        binance_top_position_short_pct=tp_short_pct,
+        binance_top_position_ratio=tp_ratio,
+        binance_taker_buy_ratio=tk_buy_pct,
+        binance_taker_sell_ratio=tk_sell_pct,
+        binance_taker_buy_vol=tk_buy,
+        binance_taker_sell_vol=tk_sell,
+        bybit_taker_buy_ratio=byt_buy,
+        okx_supported=False,     # OKX 暂不支持
+        hl_supported=False,      # HL 无全市场数据
+        confirmed_sources=confirmed,
+        unconfirmed_sources=["okx", "hyperliquid"],
+    )
+
+
+# ── v8 方向4：拆单检测 ────────────────────────────────────────────────────────
+
+def detect_split_orders(
+    trades: List[Any],
+    window_ms: int = 30_000,
+    price_tolerance_pct: float = 0.001,
+    min_count: int = 3,
+    min_notional_each: float = 10_000,
+) -> List["SplitOrderCluster"]:
+    """
+    在 trades 列表中检测拆单：30s 内同价位 ±0.1% 连续 ≥3 笔大单
+    trades 需要有 .timestamp_ms / .price / .notional / .side 属性
+    """
+    from models import SplitOrderCluster
+    import uuid as _uuid
+
+    if not trades:
+        return []
+
+    sorted_trades = sorted(trades, key=lambda t: t.timestamp_ms)
+    clusters: List[SplitOrderCluster] = []
+
+    i = 0
+    while i < len(sorted_trades):
+        anchor = sorted_trades[i]
+        if (anchor.notional or 0) < min_notional_each:
+            i += 1
+            continue
+
+        group = [anchor]
+        j = i + 1
+        while j < len(sorted_trades):
+            t = sorted_trades[j]
+            if t.timestamp_ms - anchor.timestamp_ms > window_ms:
+                break
+            if t.side != anchor.side:
+                j += 1
+                continue
+            if (t.notional or 0) < min_notional_each:
+                j += 1
+                continue
+            price_diff_pct = abs(t.price - anchor.price) / anchor.price
+            if price_diff_pct <= price_tolerance_pct:
+                group.append(t)
+            j += 1
+
+        if len(group) >= min_count:
+            prices = [t.price for t in group]
+            cluster_id = str(_uuid.uuid4())[:8]
+            clusters.append(SplitOrderCluster(
+                cluster_id=cluster_id,
+                exchange=getattr(anchor, "exchange", "unknown"),
+                market_type=getattr(anchor, "market_type", "unknown"),
+                side=anchor.side,
+                price_center=sum(prices) / len(prices),
+                price_range_pct=(max(prices) - min(prices)) / anchor.price * 100,
+                first_ms=group[0].timestamp_ms,
+                last_ms=group[-1].timestamp_ms,
+                order_count=len(group),
+                total_notional=sum(t.notional or 0 for t in group),
+                avg_interval_ms=(group[-1].timestamp_ms - group[0].timestamp_ms) / max(len(group) - 1, 1),
+            ))
+            i = j
+        else:
+            i += 1
+
+    return clusters
+
+
+# ── v8 方向6：风险板数据聚合 ──────────────────────────────────────────────────
+
+def build_risk_radar_point(
+    coin: str,
+    snapshots: List[Any],
+    oi_delta_pts: List[Any],
+    liq_events: List[Any],
+    sentiment_pt: Optional[Any] = None,
+    hl_meta: Optional[Dict[str, Any]] = None,
+    timeout: int = DEFAULT_TIMEOUT,
+) -> "RiskRadarPoint":
+    """
+    从现有数据聚合六维风险雷达图数据点。
+    HL 贡献三个独占维度：predictedFundings / perpsAtOpenInterestCap / markPx vs oraclePx
+    """
+    from models import RiskRadarPoint
+    import time as _time
+
+    now_ms = int(_time.time() * 1000)
+    ok_snaps = [s for s in snapshots if getattr(s, "status", "error") == "ok"]
+    if not ok_snaps:
+        return RiskRadarPoint(timestamp_ms=now_ms, coin=coin)
+
+    # ── 1. Funding风险 ────────────────────────────────────────────────────────
+    rates = [s.funding_rate for s in ok_snaps if s.funding_rate is not None]
+    if rates:
+        avg_rate = sum(rates) / len(rates)
+        # 极端正费率(>0.01%)=多头拥挤=风险高; 极端负费率=空头拥挤
+        funding_risk = min(1.0, max(-1.0, avg_rate * 10_000 / 10.0))
+    else:
+        funding_risk = 0.0
+
+    # ── 2. 基差风险 ────────────────────────────────────────────────────────────
+    basis_vals = []
+    for s in ok_snaps:
+        if hasattr(s, "spot_perp_spread_bps") and s.spot_perp_spread_bps is not None:
+            basis_vals.append(abs(s.spot_perp_spread_bps))
+    if basis_vals:
+        avg_basis = sum(basis_vals) / len(basis_vals)
+        basis_risk = min(1.0, avg_basis / 30.0)   # 30bps = 满风险
+    else:
+        basis_risk = 0.0
+
+    # ── 3. OI压力 ──────────────────────────────────────────────────────────────
+    if oi_delta_pts and len(oi_delta_pts) >= 5:
+        recent = oi_delta_pts[-10:]
+        velocities = [getattr(p, "oi_velocity", 0) for p in recent]
+        avg_vel = sum(velocities) / len(velocities)
+        oi_pressure = min(1.0, max(-1.0, avg_vel / 1e7))
+    else:
+        oi_pressure = 0.0
+
+    # ── 4. 清算密度 ────────────────────────────────────────────────────────────
+    if liq_events:
+        recent_ms = now_ms - 3_600_000  # 1h
+        recent_liqs = [e for e in liq_events if getattr(e, "timestamp_ms", 0) > recent_ms]
+        total_notional = sum(getattr(e, "notional", 0) or 0 for e in recent_liqs)
+        liq_density = min(1.0, total_notional / 50_000_000)  # 5000w=满风险
+    else:
+        liq_density = 0.0
+
+    # ── 5. ADL/保险基金风险（用OI集中度代理）──────────────────────────────────
+    oi_vals = [s.open_interest_notional for s in ok_snaps if s.open_interest_notional]
+    if oi_vals and len(oi_vals) > 1:
+        mx = max(oi_vals); total = sum(oi_vals)
+        adl_insurance_risk = min(1.0, (mx / total - 0.25) * 4) if total > 0 else 0.0
+    else:
+        adl_insurance_risk = 0.0
+
+    # ── 6. HL资产ctx风险（HL独占）─────────────────────────────────────────────
+    hl_risk = 0.0
+    hl_predicted_funding = None
+    hl_at_oi_cap = None
+    hl_mark_oracle_dev = None
+
+    if hl_meta:
+        # predictedFundings
+        pf = hl_meta.get("predicted_funding")
+        if pf is not None:
+            hl_predicted_funding = float(pf) * 10_000
+            hl_risk += min(0.4, abs(hl_predicted_funding) / 20.0)
+
+        # perpsAtOpenInterestCap
+        at_cap = hl_meta.get("at_oi_cap", False)
+        hl_at_oi_cap = bool(at_cap)
+        if hl_at_oi_cap:
+            hl_risk += 0.35
+
+        # markPx vs oraclePx 偏差
+        mark_px = hl_meta.get("mark_px")
+        oracle_px = hl_meta.get("oracle_px")
+        if mark_px and oracle_px and oracle_px > 0:
+            dev_pct = abs(mark_px - oracle_px) / oracle_px * 100
+            hl_mark_oracle_dev = dev_pct
+            hl_risk += min(0.25, dev_pct / 1.0)
+
+        hl_risk = min(1.0, hl_risk)
+
+    pt = RiskRadarPoint(
+        timestamp_ms=now_ms, coin=coin,
+        funding_risk=round(funding_risk, 4),
+        basis_risk=round(basis_risk, 4),
+        oi_pressure=round(oi_pressure, 4),
+        liq_density=round(liq_density, 4),
+        adl_insurance_risk=round(adl_insurance_risk, 4),
+        hl_asset_ctx_risk=round(hl_risk, 4),
+        hl_predicted_funding_bps=hl_predicted_funding,
+        hl_perps_at_oi_cap=hl_at_oi_cap,
+        hl_mark_oracle_deviation_pct=hl_mark_oracle_dev,
+    )
+    pt.compute_composite()
+    return pt

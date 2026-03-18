@@ -119,6 +119,10 @@ def build_alert_timeline_from_db(rows: List[dict]) -> go.Figure:
 
 def render_push_settings(service=None):
     """推送设置 + 数据库管理 Tab"""
+    # ── 唯一前缀：防止 @st.fragment 多次渲染时 form/widget key 冲突 ──────────────
+    # 用固定字符串前缀，不依赖运行时计数器，每个 key 全局唯一即可
+    _P = "ps_"   # push_settings prefix
+
     # Inject browser notification JS once
     st.markdown(BROWSER_NOTIFICATION_JS, unsafe_allow_html=True)
 
@@ -148,22 +152,22 @@ def render_push_settings(service=None):
         st.info("💡 获取 Bot Token：在 Telegram 中找 @BotFather，发 /newbot。\n"
                 "获取 Chat ID：找 @userinfobot，转发任意消息给它。")
 
-        with st.form("tg_config_form"):
+        with st.form(_P + "tg_config_form"):
             tg_enabled = st.checkbox("启用 Telegram 推送",
                                       value=notifier.config.telegram_enabled,
-                                      key="tg_enabled")
+                                      key=_P + "tg_enabled")
             tg_token   = st.text_input("Bot Token",
                                         value=notifier.config.telegram_token,
-                                        type="password", key="tg_token")
+                                        type="password", key=_P + "tg_token")
             tg_chat    = st.text_input("Chat ID",
                                         value=notifier.config.telegram_chat_id,
-                                        key="tg_chat")
+                                        key=_P + "tg_chat")
             min_sev    = st.selectbox("最小推送等级",
                                        ["weak", "medium", "strong"],
                                        index=["weak","medium","strong"].index(
                                            notifier.config.min_severity),
-                                       key="tg_min_sev")
-            cooldown   = st.slider("同类告警冷却时间 (秒)", 10, 300, 60, key="tg_cooldown")
+                                       key=_P + "tg_min_sev")
+            cooldown   = st.slider("同类告警冷却时间 (秒)", 10, 300, 60, key=_P + "tg_cooldown")
 
             col1, col2 = st.columns(2)
             saved = col1.form_submit_button("保存配置")
@@ -219,13 +223,13 @@ def render_push_settings(service=None):
         with col1:
             browser_enabled = st.checkbox("启用浏览器通知",
                                            value=notifier.config.browser_enabled,
-                                           key="browser_enabled_cb")
+                                           key=_P + "browser_enabled_cb")
         with col2:
             sound_enabled = st.checkbox("启用声音提示",
                                          value=notifier.config.sound_enabled,
-                                         key="sound_enabled_cb")
+                                         key=_P + "sound_enabled_cb")
 
-        if st.button("测试浏览器通知", key="test_browser_notif"):
+        if st.button("测试浏览器通知", key=_P + "test_browser_notif"):
             st.markdown(
                 get_browser_notification_html(
                     "测试通知", "多交易所终端 v6 — 浏览器通知测试成功！", "medium"
@@ -234,7 +238,7 @@ def render_push_settings(service=None):
             )
             st.success("已发送测试通知")
 
-        if st.button("测试声音告警", key="test_sound"):
+        if st.button("测试声音告警", key=_P + "test_sound"):
             st.markdown("""
             <script>
             try {
@@ -261,7 +265,7 @@ def render_push_settings(service=None):
     with sub_tabs[2]:
         st.markdown("#### 持久化历史数据查询")
 
-        db_path = st.text_input("数据库路径", value="market_data.db", key="db_path_query")
+        db_path = st.text_input("数据库路径", value="market_data.db", key=_P + "db_path_query")
 
         try:
             init_db(db_path)
@@ -279,18 +283,18 @@ def render_push_settings(service=None):
         col_a, col_b, col_c = st.columns(3)
         with col_a:
             hist_coin = st.selectbox("币种", ["BTC", "ETH", "SOL", "XRP", "BNB"],
-                                      key="hist_coin")
+                                      key=_P + "hist_coin")
         with col_b:
-            hist_hours = st.slider("查询范围 (小时)", 1, 720, 72, key="hist_hours")
+            hist_hours = st.slider("查询范围 (小时)", 1, 720, 72, key=_P + "hist_hours")
         with col_c:
             hist_type = st.selectbox("数据类型", ["OI历史", "资金费率", "每日摘要"],
-                                      key="hist_type")
+                                      key=_P + "hist_type")
 
-        if st.button("查询", key="query_hist"):
+        if st.button("查询", key=_P + "query_hist"):
             if hist_type == "OI历史":
                 rows = query_oi_history(hist_coin, hours=hist_hours, db_path=db_path)
                 if rows:
-                    st.plotly_chart(build_oi_history_figure(rows, hist_coin), config={'displayModeBar': True, 'scrollZoom': True})
+                    st.plotly_chart(build_oi_history_figure(rows, hist_coin), key=_P+"oi_hist_fig", config={'displayModeBar': True, 'scrollZoom': True})
                     st.caption(f"共 {len(rows)} 条记录")
                 else:
                     st.info("暂无历史数据。请确保已开启自动归档功能（在 Settings 中）。")
@@ -298,7 +302,7 @@ def render_push_settings(service=None):
             elif hist_type == "资金费率":
                 rows = query_funding_history(hist_coin, hours=hist_hours, db_path=db_path)
                 if rows:
-                    st.plotly_chart(build_funding_history_figure(rows, hist_coin), config={'displayModeBar': True, 'scrollZoom': True})
+                    st.plotly_chart(build_funding_history_figure(rows, hist_coin), key=_P+"fund_hist_fig", config={'displayModeBar': True, 'scrollZoom': True})
                 else:
                     st.info("暂无资金费率历史数据")
 
@@ -314,10 +318,10 @@ def render_push_settings(service=None):
         # Alert history from DB
         st.markdown("---")
         st.markdown("#### 数据库告警历史")
-        alert_hrs = st.slider("查询范围 (小时)", 1, 168, 24, key="alert_hist_hrs")
+        alert_hrs = st.slider("查询范围 (小时)", 1, 168, 24, key=_P + "alert_hist_hrs")
         alert_rows = query_alert_history(hours=alert_hrs, db_path=db_path)
         if alert_rows:
-            st.plotly_chart(build_alert_timeline_from_db(alert_rows), config={'displayModeBar': True, 'scrollZoom': True})
+            st.plotly_chart(build_alert_timeline_from_db(alert_rows), key=_P+"alert_timeline_db", config={'displayModeBar': True, 'scrollZoom': True})
             a_df_rows = [{
                 "时间": pd.Timestamp(r["timestamp_ms"], unit="ms").strftime("%m-%d %H:%M"),
                 "交易所": r.get("exchange", "-"),
@@ -333,7 +337,7 @@ def render_push_settings(service=None):
     # ── 数据库管理 ──
     with sub_tabs[3]:
         st.markdown("#### 数据库管理")
-        db_path_mgmt = st.text_input("数据库路径", value="market_data.db", key="db_path_mgmt")
+        db_path_mgmt = st.text_input("数据库路径", value="market_data.db", key=_P + "db_path_mgmt")
 
         try:
             init_db(db_path_mgmt)
@@ -351,11 +355,11 @@ def render_push_settings(service=None):
         st.markdown("---")
         st.markdown("##### 数据清理（保留最近 N 天）")
         c1, c2, c3 = st.columns(3)
-        keep_oi  = c1.number_input("OI 历史保留 (天)",      1, 365, 30, key="keep_oi")
-        keep_fr  = c2.number_input("资金费率历史保留 (天)", 1, 365, 90, key="keep_fr")
-        keep_alr = c3.number_input("告警记录保留 (天)",    1, 30,  7,  key="keep_alr")
+        keep_oi  = c1.number_input("OI 历史保留 (天)",      1, 365, 30, key=_P + "keep_oi")
+        keep_fr  = c2.number_input("资金费率历史保留 (天)", 1, 365, 90, key=_P + "keep_fr")
+        keep_alr = c3.number_input("告警记录保留 (天)",    1, 30,  7,  key=_P + "keep_alr")
 
-        if st.button("执行清理", key="do_cleanup", type="secondary"):
+        if st.button("执行清理", key=_P + "do_cleanup", type="secondary"):
             with st.spinner("清理中..."):
                 cleanup_old_data(int(keep_oi), int(keep_fr), int(keep_alr), db_path_mgmt)
             stats_after = get_db_stats(db_path_mgmt)
@@ -366,7 +370,7 @@ def render_push_settings(service=None):
         st.caption("启用后，后台线程每5分钟自动将 OI / 资金费率快照写入数据库")
         auto_archive = st.checkbox("启用自动 OI / 资金费率归档",
                                     value=st.session_state.get("auto_archive", False),
-                                    key="auto_archive_cb")
+                                    key=_P + "auto_archive_cb")
         st.session_state["auto_archive"] = auto_archive
         if service is not None:
             if auto_archive:
@@ -379,15 +383,15 @@ def render_push_settings(service=None):
         st.caption("将数据库导出为 Parquet 文件（snappy压缩），适合长期存储和离线分析")
         col_a, col_b = st.columns(2)
         with col_a:
-            parquet_dir = st.text_input("归档目录", value="parquet_archive", key="parquet_dir")
+            parquet_dir = st.text_input("归档目录", value="parquet_archive", key=_P + "parquet_dir")
         with col_b:
             parquet_tables = st.multiselect(
                 "选择导出的表",
                 ["oi_history","funding_history","daily_summary","alert_history"],
                 default=["oi_history","funding_history"],
-                key="parquet_tables",
+                key=_P + "parquet_tables",
             )
-        if st.button("立即导出 Parquet", key="do_parquet"):
+        if st.button("立即导出 Parquet", key=_P + "do_parquet"):
             with st.spinner("导出中..."):
                 results = auto_parquet_archive(parquet_tables, parquet_dir, db_path_mgmt)
             for table, path in results.items():
@@ -420,7 +424,7 @@ def render_push_settings(service=None):
                 "消息": r.message[:60],
             } for r in records]
             st.dataframe(pd.DataFrame(r_rows), width='stretch', hide_index=True)
-            if st.button("清空记录", key="clear_notif_records"):
+            if st.button("清空记录", key=_P + "clear_notif_records"):
                 notifier.clear_records()
                 st.rerun()
         else:
@@ -431,14 +435,14 @@ def render_push_settings(service=None):
         st.markdown("#### 告警命中率统计")
         st.caption("统计各类告警发出后，价格是否在指定时间内按预期方向运动（基于数据库历史）")
 
-        db_path_hr = st.text_input("数据库路径", value="market_data.db", key="db_path_hr")
+        db_path_hr = st.text_input("数据库路径", value="market_data.db", key=_P + "db_path_hr")
         col1, col2, col3 = st.columns(3)
         with col1:
-            hr_hours = st.slider("统计范围 (小时)", 1, 168, 72, key="hr_hours")
+            hr_hours = st.slider("统计范围 (小时)", 1, 168, 72, key=_P + "hr_hours")
         with col2:
-            check_window_min = st.slider("验证窗口 (分钟)", 5, 60, 15, key="hr_check_win")
+            check_window_min = st.slider("验证窗口 (分钟)", 5, 60, 15, key=_P + "hr_check_win")
         with col3:
-            min_move_pct = st.slider("最小验证涨跌幅 (%)", 0.1, 2.0, 0.3, step=0.1, key="hr_min_move")
+            min_move_pct = st.slider("最小验证涨跌幅 (%)", 0.1, 2.0, 0.3, step=0.1, key=_P + "hr_min_move")
 
         try:
             init_db(db_path_hr)
@@ -498,7 +502,7 @@ def render_push_settings(service=None):
                     xaxis_title="告警强度分", yaxis_title="次数",
                     margin=dict(l=40,r=20,t=20,b=40),
                 )
-                st.plotly_chart(fig_dist, key="alert_score_dist",
+                st.plotly_chart(fig_dist, key=_P+"alert_score_dist",
                                 config={'displayModeBar': True, 'scrollZoom': True})
 
             # Timeline heatmap by hour
@@ -525,7 +529,7 @@ def render_push_settings(service=None):
                     xaxis_title="小时 (UTC+8)", yaxis_title="告警次数",
                     margin=dict(l=40,r=20,t=20,b=40),
                 )
-                st.plotly_chart(fig_hour, key="alert_hour_dist",
+                st.plotly_chart(fig_hour, key=_P+"alert_hour_dist",
                                 config={'displayModeBar': True, 'scrollZoom': True})
 
             st.markdown("---")

@@ -55,7 +55,7 @@ CLUSTER_WINDOW_MS       = 30_000   # 30s内
 CLUSTER_MIN_NOTIONAL    = 100_000  # 10万起算
 CLUSTER_CROSS_EX_WINDOW = 15_000   # 15s内跨所=联动
 
-# Composite signal weights
+# Composite signal weights — 默认值，可通过 LiveTerminalService.set_signal_weights() 动态调整
 _CS_WEIGHTS = {"price": 0.20, "oi": 0.25, "cvd": 0.25, "funding": 0.15, "crowd": 0.15}
 
 # Recorder
@@ -166,6 +166,27 @@ class LiveTerminalService:
             try: ws.close()
             except: pass
 
+    # P1: 信号权重动态调整接口
+    def set_signal_weights(self, price: float = 0.20, oi: float = 0.25,
+                           cvd: float = 0.25, funding: float = 0.15,
+                           crowd: float = 0.15):
+        """
+        运行时动态修改合成信号权重。
+        权重会自动归一化，无需保证总和=1。
+        """
+        raw = {"price": max(0, price), "oi": max(0, oi), "cvd": max(0, cvd),
+               "funding": max(0, funding), "crowd": max(0, crowd)}
+        total = sum(raw.values())
+        if total <= 0:
+            return  # 拒绝全零配置
+        with self.lock:
+            self._custom_weights = {k: v / total for k, v in raw.items()}
+
+    def get_signal_weights(self) -> dict:
+        """返回当前生效的权重（自定义或默认）"""
+        with self.lock:
+            return dict(getattr(self, "_custom_weights", _CS_WEIGHTS))
+
     def current_snapshots(self) -> List[ExchangeSnapshot]:
         snapshots = []
         with self.lock:
@@ -205,6 +226,15 @@ class LiveTerminalService:
         with self.lock:
             book = self.local_books[ek]
             return book.to_levels(depth) if book.is_ready else []
+
+    def set_composite_weights(self, weights: dict):
+        """P1: 从 UI 注入用户自定义的合成信号权重（线程安全）"""
+        if not weights:
+            return
+        w_total = sum(weights.values()) or 1.0
+        normalized = {k: v / w_total for k, v in weights.items()}
+        with self.lock:
+            self._custom_weights = normalized
     def get_oi_history(self, ek):
         with self.lock: return list(self.oi_history.get(ek,[]))
     def get_liquidation_history(self, ek):
@@ -625,8 +655,14 @@ class LiveTerminalService:
     # ══════════════════════════════════════════════════════════════════════════
 
     def _compute_composite_signal_locked(self, ek: str, snap: ExchangeSnapshot):
-        """OI + CVD + Funding + Crowd + Price → single composite score"""
+        """OI + CVD + Funding + Crowd + Price → single composite score
+        P1 升级：优先使用 UI 传入的自定义权重（通过 set_composite_weights 注入）
+        """
         now_ms = int(time.time() * 1000)
+
+        # 读取自定义权重（P1 新增）
+        custom_w = getattr(self, "_custom_cs_weights", None)
+        raw_w = custom_w if custom_w else _CS_WEIGHTS
 
         # 1. Price momentum score (-1 to +1)
         ph = list(self._price_history_short[ek])
@@ -669,13 +705,14 @@ class LiveTerminalService:
         # Use funding as proxy: extreme positive = long crowded (bearish pressure)
         crowd_score = max(-1., min(1., -fr * 5000))
 
-        # Weighted composite
+        # Weighted composite — 优先使用用户自定义权重，否则使用全局默认
+        weights = getattr(self, "_custom_weights", _CS_WEIGHTS)
         composite = (
-            _CS_WEIGHTS["price"]   * price_score +
-            _CS_WEIGHTS["oi"]      * oi_score +
-            _CS_WEIGHTS["cvd"]     * cvd_score +
-            _CS_WEIGHTS["funding"] * funding_score +
-            _CS_WEIGHTS["crowd"]   * crowd_score
+            weights["price"]   * price_score +
+            weights["oi"]      * oi_score +
+            weights["cvd"]     * cvd_score +
+            weights["funding"] * funding_score +
+            weights["crowd"]   * crowd_score
         )
         composite = max(-1., min(1., composite))
 
@@ -880,6 +917,8 @@ class LiveTerminalService:
                 if self.stop_ev.wait(3): return
 
     def _run_spot_ws_worker(self, ek: str):
+        # P2: 指数退避重连，上限 60s，与主 WS worker 策略对齐
+        _backoff = 3.0
         while not self.stop_ev.is_set():
             coin = self._get_spot_symbol(ek)
             if not coin:
@@ -891,9 +930,14 @@ class LiveTerminalService:
                 on_message= lambda ws,msg,k=ek,c=coin: self._on_spot_message(k,c,msg),
                 on_error  = lambda ws,err: None)
             self.ws_apps[f"spot_{ek}"] = app
-            try: app.run_forever(ping_interval=20, ping_timeout=10)
-            except: pass
-            if self.stop_ev.wait(3): return
+            try:
+                app.run_forever(ping_interval=20, ping_timeout=10)
+                _backoff = 3.0   # 正常断开，重置退避
+            except Exception:
+                pass
+            # P2: 指数退避等待后重连
+            if self.stop_ev.wait(_backoff): return
+            _backoff = min(60.0, _backoff * 2)
 
     def _get_spot_symbol(self, ek: str) -> Optional[str]:
         sym = self.symbol_map.get(ek, "")

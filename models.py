@@ -864,3 +864,261 @@ class DailyMarketSummary:
     liq_long_pct: float
     max_sentiment_score: float
     min_sentiment_score: float
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# v8 — 六方向升级：合约情绪 / 现货合约分账 / 清算置信度 / 鲸鱼分账 / 真实持仓 / 风险板
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ── 方向1：合约情绪真值层 ─────────────────────────────────────────────────────
+@dataclass
+class ContractSentimentPoint:
+    """
+    合约情绪真值点 — 严格区分已确认(confirmed) vs 未确认(unconfirmed)
+    Binance: 4端点并发对齐到同一 timestamp
+    Bybit:   仅 buyRatio（Taker方向，非持仓）
+    OKX:     UI标"暂不支持"，数据为 None
+    HL:      UI标"无全市场数据"，数据为 None
+    """
+    timestamp_ms: int
+    # Binance 全市场账户多空（已确认）
+    binance_global_long_pct: Optional[float] = None
+    binance_global_short_pct: Optional[float] = None
+    binance_global_ratio: Optional[float] = None
+    # Binance 大户账户多空（已确认）
+    binance_top_account_long_pct: Optional[float] = None
+    binance_top_account_short_pct: Optional[float] = None
+    binance_top_account_ratio: Optional[float] = None
+    # Binance 大户持仓多空（已确认）
+    binance_top_position_long_pct: Optional[float] = None
+    binance_top_position_short_pct: Optional[float] = None
+    binance_top_position_ratio: Optional[float] = None
+    # Binance Taker 买卖量比（已确认）
+    binance_taker_buy_ratio: Optional[float] = None
+    binance_taker_sell_ratio: Optional[float] = None
+    binance_taker_buy_vol: Optional[float] = None
+    binance_taker_sell_vol: Optional[float] = None
+    # Bybit Taker方向买比（已确认，非持仓）
+    bybit_taker_buy_ratio: Optional[float] = None
+    # OKX — 暂不支持（UI标注，不报错）
+    okx_supported: bool = False
+    # HL — 无全市场数据
+    hl_supported: bool = False
+    # 数据质量标签
+    confirmed_sources: List[str] = field(default_factory=list)
+    unconfirmed_sources: List[str] = field(default_factory=list)
+
+
+# ── 方向2：现货合约分账 ────────────────────────────────────────────────────────
+@dataclass
+class SpotFlowSnapshot:
+    """现货流视图 — 主动买卖/盘口/补单速度，无多空比"""
+    timestamp_ms: int
+    exchange: str
+    taker_buy_vol: Optional[float] = None
+    taker_sell_vol: Optional[float] = None
+    taker_buy_ratio: Optional[float] = None   # buy/(buy+sell)
+    bid_notional: Optional[float] = None
+    ask_notional: Optional[float] = None
+    ob_imbalance_pct: Optional[float] = None
+    refill_speed: Optional[float] = None      # 每分钟补单次数估算
+    spread_bps: Optional[float] = None
+    # 注意：绝对没有 long_short_ratio 字段，现货视角不显示多空比
+
+
+@dataclass
+class PerpFlowSnapshot:
+    """合约流视图 — 全套合约指标，含多空比"""
+    timestamp_ms: int
+    exchange: str
+    taker_buy_vol: Optional[float] = None
+    taker_sell_vol: Optional[float] = None
+    taker_buy_ratio: Optional[float] = None
+    bid_notional: Optional[float] = None
+    ask_notional: Optional[float] = None
+    ob_imbalance_pct: Optional[float] = None
+    spread_bps: Optional[float] = None
+    # 合约专属：多空比（仅合约视角显示）
+    long_short_ratio: Optional[float] = None
+    long_pct: Optional[float] = None
+    short_pct: Optional[float] = None
+    oi_notional: Optional[float] = None
+    oi_delta: Optional[float] = None
+    funding_rate: Optional[float] = None
+
+
+@dataclass
+class CombinedFlowView:
+    """联合视图 — 现货+合约对照"""
+    timestamp_ms: int
+    exchange: str
+    spot: Optional[SpotFlowSnapshot] = None
+    perp: Optional[PerpFlowSnapshot] = None
+    spot_perp_spread_bps: Optional[float] = None
+    lead_lag_signal: str = "neutral"          # spot_lead / perp_lead / neutral
+    divergence_score: float = 0.0
+
+
+# ── 方向3：清算热力图置信度分级 ──────────────────────────────────────────────
+@dataclass
+class LiquidationWithConfidence:
+    """带置信度标签的清算事件"""
+    base_event: LiquidationEvent
+    # 置信度分级：Bybit WS=1.0 / Binance WS=0.5 / OKX REST=0.3 / HL=0.2
+    confidence: float = 0.5
+    confidence_label: str = "unknown"
+    # 渲染属性（透明度 = confidence，形状根据来源不同）
+    render_opacity: float = 0.5
+    render_symbol: str = "circle"             # circle/circle-open/diamond/x
+    render_color: str = "#ff6868"
+
+    @classmethod
+    def from_event(cls, event: LiquidationEvent) -> "LiquidationWithConfidence":
+        exchange = event.exchange.lower()
+        source   = event.source.lower()
+        if exchange == "bybit" and source == "ws":
+            conf, label, sym = 1.0, "真实(Bybit WS)", "circle"
+        elif exchange == "binance" and source == "ws":
+            conf, label, sym = 0.5, "可能漏单(Binance WS)", "circle-open"
+        elif exchange == "okx":
+            conf, label, sym = 0.3, "仅参考(OKX REST)", "diamond"
+        elif exchange == "hyperliquid":
+            conf, label, sym = 0.2, "推断(HL)", "x"
+        else:
+            conf, label, sym = 0.4, "未知来源", "circle-open"
+        color = "#ff6868" if event.side == "long" else "#1dc796"
+        return cls(base_event=event, confidence=conf, confidence_label=label,
+                   render_opacity=max(0.15, conf), render_symbol=sym, render_color=color)
+
+LIQUIDATION_CONFIDENCE = {
+    "bybit_ws":       (1.0, "真实",     "circle"),
+    "binance_ws":     (0.5, "可能漏单", "circle-open"),
+    "okx_rest":       (0.3, "仅参考",   "diamond"),
+    "hyperliquid":    (0.2, "推断",     "x"),
+}
+
+
+# ── 方向4：鲸鱼热力图分账 ─────────────────────────────────────────────────────
+@dataclass
+class SpotLargeOrderFlow:
+    """现货大单流（独立存储，不与合约混用）"""
+    timestamp_ms: int
+    exchange: str
+    side: str
+    price: float
+    notional: float
+    is_aggressor: bool
+    market_type: str = "spot"
+    # 拆单检测（30s内同价位±0.1%连续≥3笔）
+    is_split_order: bool = False
+    split_group_id: Optional[str] = None
+    split_count: int = 0
+
+
+@dataclass
+class PerpLargeOrderFlow:
+    """合约大单流（独立存储，不与现货混用）"""
+    timestamp_ms: int
+    exchange: str
+    side: str
+    price: float
+    notional: float
+    is_aggressor: bool
+    market_type: str = "perp"
+    # 拆单检测
+    is_split_order: bool = False
+    split_group_id: Optional[str] = None
+    split_count: int = 0
+    # 合约专属
+    oi_context: Optional[str] = None          # "加仓" / "减仓" / "unknown"
+
+
+@dataclass
+class SplitOrderCluster:
+    """拆单聚合簇（30s内同价位±0.1%连续≥3笔）"""
+    cluster_id: str
+    exchange: str
+    market_type: str                           # spot / perp
+    side: str
+    price_center: float
+    price_range_pct: float                     # 实际价格范围 pct
+    first_ms: int
+    last_ms: int
+    order_count: int
+    total_notional: float
+    avg_interval_ms: float
+
+
+# ── 方向5：真实持仓 ────────────────────────────────────────────────────────────
+@dataclass
+class PrivatePositionSnapshot:
+    """
+    私有持仓快照 — API Key 只存 session_state，绝不入数据库
+    强制只读 GET 方法，UI显著标注
+    """
+    timestamp_ms: int
+    exchange: str
+    coin: str
+    side: str                      # long / short
+    size: float
+    notional: float
+    entry_price: Optional[float]
+    mark_price: Optional[float]
+    unrealized_pnl: Optional[float]
+    leverage: Optional[float]
+    margin_used: Optional[float]
+    liquidation_price: Optional[float]
+    # 安全标注
+    data_source: str = "private_api"   # private_api / public_hl
+    is_read_only: bool = True          # 强制只读标志
+
+
+@dataclass
+class PublicHLPositionView:
+    """公开模式 — 复用现有 HL 地址分析"""
+    address: str
+    coin: str
+    positions: List[PrivatePositionSnapshot] = field(default_factory=list)
+    total_notional: float = 0.0
+    data_source: str = "hl_public"
+
+
+# ── 方向6：统一风险板 ─────────────────────────────────────────────────────────
+@dataclass
+class RiskRadarPoint:
+    """六维风险雷达图数据点"""
+    timestamp_ms: int
+    coin: str
+    # 六维指标（-1 到 +1 归一化，+1=极度危险）
+    funding_risk: float = 0.0          # Funding机制风险
+    basis_risk: float = 0.0            # 基差机制风险
+    oi_pressure: float = 0.0           # OI压力
+    liq_density: float = 0.0           # 清算密度
+    adl_insurance_risk: float = 0.0    # ADL保险基金风险
+    hl_asset_ctx_risk: float = 0.0     # HL资产ctx风险（HL独占）
+    # HL 独占维度（其他所没有）
+    hl_predicted_funding_bps: Optional[float] = None
+    hl_perps_at_oi_cap: Optional[bool] = None
+    hl_mark_oracle_deviation_pct: Optional[float] = None
+    # 综合风险得分
+    composite_risk: float = 0.0
+    risk_label: str = "低风险"
+    risk_color: str = "#1dc796"
+
+    def compute_composite(self) -> float:
+        dims = [self.funding_risk, self.basis_risk, self.oi_pressure,
+                self.liq_density, self.adl_insurance_risk, self.hl_asset_ctx_risk]
+        weights = [0.20, 0.15, 0.25, 0.20, 0.10, 0.10]
+        score = sum(d * w for d, w in zip(dims, weights))
+        self.composite_risk = round(max(-1.0, min(1.0, score)), 4)
+        if self.composite_risk > 0.6:
+            self.risk_label, self.risk_color = "极高风险", "#ff4444"
+        elif self.composite_risk > 0.3:
+            self.risk_label, self.risk_color = "高风险", "#ff8c00"
+        elif self.composite_risk > 0.0:
+            self.risk_label, self.risk_color = "中等风险", "#ffa94d"
+        elif self.composite_risk > -0.3:
+            self.risk_label, self.risk_color = "低风险", "#62c2ff"
+        else:
+            self.risk_label, self.risk_color = "极低风险", "#1dc796"
+        return self.composite_risk

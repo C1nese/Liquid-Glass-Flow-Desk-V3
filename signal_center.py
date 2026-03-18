@@ -1,6 +1,7 @@
 """
-signal_center.py  —  信号增强中心 Tab（v6）
+signal_center.py  —  信号增强中心 Tab（v6 → v7）
 覆盖：套利信号 / 情绪评分 / VPIN / 微结构 / K线形态 / 回测 / 跨所主导权
+P1 升级：合成信号权重可调 UI / 市场热力图扫描 Tab
 """
 from __future__ import annotations
 import time
@@ -17,6 +18,9 @@ from aggregator import (
     compute_sentiment_score, detect_candle_patterns,
     detect_microstructure_anomalies, backtest_candle_signal,
     VPINCalculator,
+    # P1 新增
+    compute_composite_score, DEFAULT_CS_WEIGHTS,
+    build_market_heatmap, build_market_heatmap_figure,
 )
 from collections import defaultdict
 from models import (
@@ -247,6 +251,8 @@ def render_signal_center(snapshots: List[ExchangeSnapshot],
         "🐋 大单流量聚合",
         "🎭 墙体消失告警",
         "📈 多币种横向对比",
+        "⚖️ 信号权重调节",   # P1 新增
+        "🗺️ 市场热力扫描",   # P1 新增
     ])
 
     # ── 套利监控 ──
@@ -779,3 +785,155 @@ def render_signal_center(snapshots: List[ExchangeSnapshot],
                 st.info("当前快照中暂无所选币种数据")
         else:
             st.info("请选择至少一个币种并等待数据加载")
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # P1 新增 Tab 10 — 合成信号权重调节器
+    # ══════════════════════════════════════════════════════════════════════════
+    with sub_tabs[10]:
+        st.markdown("#### ⚖️ 合成信号权重调节")
+        st.caption(
+            "调节各因子在合成信号中的权重，实时预览不同权重方案下的信号结果。"
+            "调整后权重会存储在 session_state 中，供当前会话的其他模块参考。"
+        )
+
+        st.markdown("---")
+        col_w1, col_w2 = st.columns([1, 1])
+
+        with col_w1:
+            st.markdown("##### 权重设置（合计自动归一）")
+            w_price   = st.slider("价格动能  Price",   0, 50, int(DEFAULT_CS_WEIGHTS["price"]   * 100), 5, key="cw_price")
+            w_oi      = st.slider("OI 方向   OI",      0, 50, int(DEFAULT_CS_WEIGHTS["oi"]      * 100), 5, key="cw_oi")
+            w_cvd     = st.slider("CVD 流向  CVD",     0, 50, int(DEFAULT_CS_WEIGHTS["cvd"]     * 100), 5, key="cw_cvd")
+            w_funding = st.slider("资金费率  Funding", 0, 50, int(DEFAULT_CS_WEIGHTS["funding"] * 100), 5, key="cw_funding")
+            w_crowd   = st.slider("拥挤度    Crowd",   0, 50, int(DEFAULT_CS_WEIGHTS["crowd"]   * 100), 5, key="cw_crowd")
+
+        raw_total = w_price + w_oi + w_cvd + w_funding + w_crowd
+        if raw_total == 0:
+            raw_total = 1
+        custom_weights = {
+            "price":   w_price   / raw_total,
+            "oi":      w_oi      / raw_total,
+            "cvd":     w_cvd     / raw_total,
+            "funding": w_funding / raw_total,
+            "crowd":   w_crowd   / raw_total,
+        }
+        # 写入 session_state 供 realtime.py 的 _CS_WEIGHTS 参考
+        st.session_state["composite_weights"] = custom_weights
+
+        with col_w2:
+            st.markdown("##### 当前归一化权重")
+            w_rows = [
+                {"因子": "价格动能", "权重": f"{custom_weights['price']:.1%}"},
+                {"因子": "OI 方向",  "权重": f"{custom_weights['oi']:.1%}"},
+                {"因子": "CVD 流向", "权重": f"{custom_weights['cvd']:.1%}"},
+                {"因子": "资金费率", "权重": f"{custom_weights['funding']:.1%}"},
+                {"因子": "拥挤度",   "权重": f"{custom_weights['crowd']:.1%}"},
+            ]
+            st.dataframe(pd.DataFrame(w_rows), width="stretch", hide_index=True)
+
+            # 预设方案
+            st.markdown("##### 快速预设方案")
+            preset_col1, preset_col2, preset_col3 = st.columns(3)
+            if preset_col1.button("📊 均衡", key="preset_balanced"):
+                for k in ["cw_price","cw_oi","cw_cvd","cw_funding","cw_crowd"]:
+                    st.session_state[k] = 20
+                st.rerun()
+            if preset_col2.button("🌊 流动性优先", key="preset_flow"):
+                st.session_state["cw_price"]   = 10
+                st.session_state["cw_oi"]       = 30
+                st.session_state["cw_cvd"]      = 40
+                st.session_state["cw_funding"]  = 10
+                st.session_state["cw_crowd"]    = 10
+                st.rerun()
+            if preset_col3.button("💰 费率优先", key="preset_funding"):
+                st.session_state["cw_price"]   = 15
+                st.session_state["cw_oi"]       = 20
+                st.session_state["cw_cvd"]      = 15
+                st.session_state["cw_funding"]  = 35
+                st.session_state["cw_crowd"]    = 15
+                st.rerun()
+
+        st.markdown("---")
+        st.markdown("##### 当前权重下的实时预览")
+
+        # 用当前快照因子重新计算合成信号
+        preview_cols = st.columns(min(4, len(snapshots)) or 1)
+        for i, snap in enumerate([s for s in snapshots if s.status == "ok"][:4]):
+            # 构造近似因子得分（与 realtime.py 逻辑一致）
+            fr = snap.funding_rate or 0.0
+            funding_score = max(-1., min(1., -fr * 3000))
+            crowd_score   = max(-1., min(1., -fr * 5000))
+            # price_score / oi_score / cvd_score 无历史，此处用 0 作占位
+            composite, confidence, label, color = compute_composite_score(
+                price_score=0.0, oi_score=0.0, cvd_score=0.0,
+                funding_score=funding_score, crowd_score=crowd_score,
+                weights=custom_weights,
+            )
+            with preview_cols[i % 4]:
+                st.markdown(
+                    f'<div style="padding:10px;border-radius:14px;border:1px solid {color}40;'
+                    f'background:rgba(255,255,255,0.05);text-align:center;">'
+                    f'<div style="font-size:0.75rem;color:#bcd;">{snap.exchange.capitalize()}</div>'
+                    f'<div style="font-size:1.1rem;font-weight:800;color:{color};">{label}</div>'
+                    f'<div style="font-size:0.78rem;color:#aac;">'
+                    f'合成 <b style="color:{color};">{composite:+.2f}</b>  '
+                    f'置信 <b>{confidence:.0%}</b></div>'
+                    f'</div>',
+                    unsafe_allow_html=True,
+                )
+        st.info("💡 注意：预览仅含资金费率/拥挤度因子（实时历史因子需 WS 服务积累数据后方可完整计算）")
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # P1 新增 Tab 11 — 市场热力扫描
+    # ══════════════════════════════════════════════════════════════════════════
+    with sub_tabs[11]:
+        st.markdown("#### 🗺️ 全市场热力扫描")
+        st.caption(
+            "将全市场扫描结果以 Treemap 热力图呈现：块面积 = 指标绝对值大小，"
+            "颜色 = 方向（绿=正向/多头，红=负向/空头）。"
+        )
+
+        hm_metric = st.selectbox(
+            "热力指标",
+            options=[
+                ("oi_change_1h_pct",  "OI 1h变化%"),
+                ("funding_bps",       "资金费率(bps)"),
+                ("liq_1h_notional",   "1h爆仓额"),
+                ("vol_change_pct",    "成交量变化%"),
+                ("price_change_pct",  "价格变化%"),
+            ],
+            format_func=lambda x: x[1],
+            key="hm_metric_sel",
+        )
+        metric_key = hm_metric[0] if isinstance(hm_metric, tuple) else hm_metric
+
+        # 尝试从 session_state 取上次扫描结果（由 homepage 的 MarketScanClient 填充）
+        _scan_rows = st.session_state.get("last_market_scan_rows", [])
+
+        if _scan_rows:
+            hm_data = build_market_heatmap(_scan_rows, metric=metric_key)
+            hm_fig  = build_market_heatmap_figure(hm_data)
+            if hm_fig:
+                st.plotly_chart(hm_fig, use_container_width=True,
+                                config={"displayModeBar": False})
+
+                # 明细表格
+                if hm_data:
+                    tbl_rows = [
+                        {"币种": c, "值": t, "排名": i + 1}
+                        for i, (c, t) in enumerate(zip(hm_data["coins"], hm_data["texts"]))
+                    ]
+                    st.dataframe(pd.DataFrame(tbl_rows), width="stretch", hide_index=True)
+            else:
+                st.warning("热力图数据构建失败，请检查市场扫描数据格式")
+        else:
+            st.info(
+                "暂无市场扫描数据。请先在「全市场首页」Tab 触发一次扫描，"
+                "或等待自动扫描完成（约 30s 缓存）。"
+            )
+
+        st.markdown("---")
+        st.caption(
+            "数据来源：`exchanges.MarketScanClient.fetch_market_batch`，"
+            "缓存 TTL 30s。热力图仅展示当前快照，历史回溯请使用「推送&历史数据」Tab。"
+        )

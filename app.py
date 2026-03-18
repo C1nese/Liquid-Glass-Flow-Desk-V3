@@ -1,10 +1,19 @@
 from __future__ import annotations
+import logging
 import time, uuid
 from typing import Dict, List, Optional
 import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import streamlit as st
+
+# ── P2: 统一日志记录器 ────────────────────────────────────────────────────────
+_logger = logging.getLogger("liquidity_terminal")
+if not _logger.handlers:
+    _h = logging.StreamHandler()
+    _h.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
+    _logger.addHandler(_h)
+_logger.setLevel(logging.WARNING)
 
 # ── Standard library analytics & exchanges ────────────────────────────────────
 from analytics import (
@@ -29,6 +38,14 @@ from analytics import (
     build_replay_price_figure,
     detect_price_levels, build_price_levels_annotations,
     build_bull_bear_power_figure, detect_hot_coins,
+    # P1 新增：MACD / ATR
+    build_macd_atr_figure, calc_macd, calc_atr,
+    # v8 新增
+    build_contract_sentiment_figure, build_sentiment_gauge_html,
+    build_spot_flow_figure, build_perp_flow_figure, build_combined_flow_figure,
+    build_liq_confidence_heatmap,
+    build_whale_heatmap_figure,
+    build_risk_radar_figure, build_risk_history_figure,
 )
 from exchanges import (
     EXCHANGE_ORDER, SUPPORTED_INTERVALS, default_symbols,
@@ -38,10 +55,14 @@ from exchanges import (
     fetch_exchange_global_long_short_ratio,
     fetch_exchange_spot_ticker, fetch_exchange_futures_oi_list,
     interval_to_millis, MARKET_SCAN_COINS as _SCAN_COINS,
+    fetch_contract_sentiment_point, detect_split_orders, build_risk_radar_point,
 )
 from models import (
     Candle, ExchangeSnapshot, LiquidationEvent, OIPoint, OrderBookLevel,
     AlertRule, AlertEvent, LocalOrderBook,
+    ContractSentimentPoint, LiquidationWithConfidence,
+    SpotFlowSnapshot, PerpFlowSnapshot, CombinedFlowView,
+    SpotLargeOrderFlow, PerpLargeOrderFlow, SplitOrderCluster, RiskRadarPoint,
 )
 from realtime import LiveTerminalService
 
@@ -75,6 +96,19 @@ try:
     _HAS_LS_COUNT = True
 except ImportError:
     _HAS_LS_COUNT = False
+
+# ── v8 模块 ────────────────────────────────────────────────────────────────────
+try:
+    from exchanges import fetch_contract_sentiment_point as _fcs
+    _HAS_V8_SENTIMENT = True
+except ImportError:
+    _HAS_V8_SENTIMENT = False
+
+try:
+    import private_client as _private_client_mod
+    _HAS_PRIVATE_CLIENT = True
+except ImportError:
+    _HAS_PRIVATE_CLIENT = False
 
 # ── 资金费率倒计时 + 智能刷新 ─────────────────────────────────────────────────
 
@@ -191,61 +225,96 @@ div[data-testid="stAlert"]{border-radius:16px;border:1px solid rgba(255,255,255,
 
 # ── Cached loaders ─────────────────────────────────────────────────────────────
 @st.cache_data(ttl=15, show_spinner=False, max_entries=32)
-def load_candles(ek,sym,iv,lim,to):
-    try: return fetch_exchange_candles(ek,sym,iv,lim,timeout=to)
-    except: return []
+def load_candles(ek, sym, iv, lim, to):
+    try:
+        return fetch_exchange_candles(ek, sym, iv, lim, timeout=to)
+    except Exception as e:
+        _logger.warning("load_candles %s/%s: %s", ek, sym, e)
+        return []
 
 @st.cache_data(ttl=5, show_spinner=False, max_entries=16)
-def load_orderbook(ek,sym,lim,to):
-    try: return fetch_exchange_orderbook(ek,sym,lim,timeout=to)
-    except: return []
+def load_orderbook(ek, sym, lim, to):
+    try:
+        return fetch_exchange_orderbook(ek, sym, lim, timeout=to)
+    except Exception as e:
+        _logger.warning("load_orderbook %s/%s: %s", ek, sym, e)
+        return []
 
 @st.cache_data(ttl=90, show_spinner=False, max_entries=16)
-def load_oi_backfill(ek,sym,iv,lim,to):
-    try: return fetch_exchange_oi_history(ek,sym,iv,lim,timeout=to)
-    except: return []
+def load_oi_backfill(ek, sym, iv, lim, to):
+    try:
+        return fetch_exchange_oi_history(ek, sym, iv, lim, timeout=to)
+    except Exception as e:
+        _logger.warning("load_oi_backfill %s/%s: %s", ek, sym, e)
+        return []
 
 @st.cache_data(ttl=10, show_spinner=False)
-def load_liquidations(ek,sym,lim,to):
-    try: return fetch_exchange_liquidations(ek,sym,lim,timeout=to)
-    except: return []
+def load_liquidations(ek, sym, lim, to):
+    try:
+        return fetch_exchange_liquidations(ek, sym, lim, timeout=to)
+    except Exception as e:
+        _logger.warning("load_liquidations %s/%s: %s", ek, sym, e)
+        return []
 
 @st.cache_data(ttl=30, show_spinner=False)
-def load_trades(ek,sym,lim,to):
-    try: return fetch_exchange_recent_trades(ek,sym,lim,timeout=to)
-    except: return []
+def load_trades(ek, sym, lim, to):
+    try:
+        return fetch_exchange_recent_trades(ek, sym, lim, timeout=to)
+    except Exception as e:
+        _logger.warning("load_trades %s/%s: %s", ek, sym, e)
+        return []
 
 @st.cache_data(ttl=60, show_spinner=False)
-def load_top_trader(ek,sym,iv,lim,to):
-    try: return fetch_exchange_top_trader_ratio(ek,sym,iv,lim,timeout=to)
-    except: return []
+def load_top_trader(ek, sym, iv, lim, to):
+    try:
+        return fetch_exchange_top_trader_ratio(ek, sym, iv, lim, timeout=to)
+    except Exception as e:
+        _logger.warning("load_top_trader %s/%s: %s", ek, sym, e)
+        return []
 
 @st.cache_data(ttl=60, show_spinner=False)
-def load_global_ratio(ek,sym,iv,lim,to):
-    try: return fetch_exchange_global_long_short_ratio(ek,sym,iv,lim,timeout=to)
-    except: return []
+def load_global_ratio(ek, sym, iv, lim, to):
+    try:
+        return fetch_exchange_global_long_short_ratio(ek, sym, iv, lim, timeout=to)
+    except Exception as e:
+        _logger.warning("load_global_ratio %s/%s: %s", ek, sym, e)
+        return []
 
 @st.cache_data(ttl=60, show_spinner=False)
-def load_spot_ticker(ek,coin,to):
-    try: return fetch_exchange_spot_ticker(ek,coin,timeout=to)
-    except: return None
+def load_spot_ticker(ek, coin, to):
+    try:
+        return fetch_exchange_spot_ticker(ek, coin, timeout=to)
+    except Exception as e:
+        _logger.warning("load_spot_ticker %s/%s: %s", ek, coin, e)
+        return None
 
 @st.cache_data(ttl=120, show_spinner=False)
-def load_futures_oi_list(ek,coin,to):
-    try: return fetch_exchange_futures_oi_list(ek,coin,timeout=to)
-    except: return []
+def load_futures_oi_list(ek, coin, to):
+    try:
+        return fetch_exchange_futures_oi_list(ek, coin, timeout=to)
+    except Exception as e:
+        _logger.warning("load_futures_oi_list %s/%s: %s", ek, coin, e)
+        return []
 
 @st.cache_data(ttl=45, show_spinner=False)
-def load_ls_count(sym,iv,lim,to):
-    if not _HAS_LS_COUNT: return []
-    try: return fetch_binance_long_short_count(sym,iv,lim,to)
-    except: return []
+def load_ls_count(sym, iv, lim, to):
+    if not _HAS_LS_COUNT:
+        return []
+    try:
+        return fetch_binance_long_short_count(sym, iv, lim, to)
+    except Exception as e:
+        _logger.warning("load_ls_count %s: %s", sym, e)
+        return []
 
 @st.cache_data(ttl=45, show_spinner=False)
-def load_taker_ratio(sym,iv,lim,to):
-    if not _HAS_LS_COUNT: return []
-    try: return fetch_binance_taker_ratio(sym,iv,lim,to)
-    except: return []
+def load_taker_ratio(sym, iv, lim, to):
+    if not _HAS_LS_COUNT:
+        return []
+    try:
+        return fetch_binance_taker_ratio(sym, iv, lim, to)
+    except Exception as e:
+        _logger.warning("load_taker_ratio %s: %s", sym, e)
+        return []
 
 @st.cache_data(ttl=30, show_spinner=False)
 def load_market_batch_cached(coins_tuple: tuple, timeout: int):
@@ -254,7 +323,20 @@ def load_market_batch_cached(coins_tuple: tuple, timeout: int):
         from exchanges import MarketScanClient
         client = MarketScanClient(timeout=timeout)
         return client.fetch_market_batch(list(coins_tuple), max_workers=10)
-    except: return []
+    except Exception as e:
+        _logger.warning("load_market_batch_cached: %s", e)
+        return []
+
+
+# ── v8 캐시된 로더 ────────────────────────────────────────────────────────────
+@st.cache_data(ttl=30, show_spinner=False)
+def load_contract_sentiment(binance_sym: str, bybit_sym: str, interval: str, to: int):
+    """v8 방향1: 합약 감정 진실층 — Binance 4端点 + Bybit Taker 병렬"""
+    try:
+        return fetch_contract_sentiment_point(binance_sym, bybit_sym, interval, timeout=to)
+    except Exception as e:
+        _logger.warning("load_contract_sentiment: %s", e)
+        return None
 
 
 # ── Formatters ─────────────────────────────────────────────────────────────────
@@ -782,10 +864,12 @@ with st.sidebar:
     req_timeout    = st.slider("请求超时秒数", 5, 20, 10, 1)
     st.markdown("---")
     st.subheader("📊 K线技术指标")
-    show_ma  = st.checkbox("均线 MA5/20/60", value=True,  key="ind_ma")
-    show_bb  = st.checkbox("布林带 BB(20,2)", value=False, key="ind_bb")
-    show_rsi = st.checkbox("RSI(14)",         value=False, key="ind_rsi")
-    show_levels = st.checkbox("价格关口标注",  value=True,  key="show_levels")
+    show_ma   = st.checkbox("均线 MA5/20/60",      value=True,  key="ind_ma")
+    show_bb   = st.checkbox("布林带 BB(20,2)",      value=False, key="ind_bb")
+    show_rsi  = st.checkbox("RSI(14)",              value=False, key="ind_rsi")
+    show_macd = st.checkbox("MACD(12,26,9)",        value=False, key="ind_macd")
+    show_atr  = st.checkbox("ATR(14) 真实波动率",   value=False, key="ind_atr")
+    show_levels = st.checkbox("价格关口标注",        value=True,  key="show_levels")
     st.markdown("---")
     st.subheader("📡 多币种轮巡")
     watchlist_input = st.text_input("监控币种（逗号分隔）", value=",".join(WATCHLIST_DEFAULT))
@@ -863,9 +947,11 @@ st.markdown(f"""
 @st.fragment(run_every=_effective_refresh)
 def render_terminal():
     # Read sidebar indicator flags from session state (set outside fragment)
-    show_ma  = st.session_state.get("ind_ma",  True)
-    show_bb  = st.session_state.get("ind_bb",  False)
-    show_rsi = st.session_state.get("ind_rsi", False)
+    show_ma   = st.session_state.get("ind_ma",   True)
+    show_bb   = st.session_state.get("ind_bb",   False)
+    show_rsi  = st.session_state.get("ind_rsi",  False)
+    show_macd = st.session_state.get("ind_macd", False)
+    show_atr  = st.session_state.get("ind_atr",  False)
     # Lazy-import center modules INSIDE the fragment to avoid early @st.cache_data trigger
     from homepage     import render_homepage
     from liq_center   import render_liq_center
@@ -874,6 +960,14 @@ def render_terminal():
 
     snapshots   = service.current_snapshots()
     ok_snaps    = [s for s in snapshots if s.status=="ok"]
+
+    # P1: 每次渲染周期将 UI 调节的权重同步到 service
+    _cw = st.session_state.get("composite_weights")
+    if _cw and hasattr(service, "set_composite_weights"):
+        try:
+            service.set_composite_weights(_cw)
+        except Exception:
+            pass
     status_text = " · ".join(status_caption(s) for s in snapshots)
     st.markdown(
         '<div class="status-strip">{}</div>'.format(status_text),
@@ -1033,7 +1127,7 @@ def render_terminal():
         "💧 CVD主动买卖",
         "🔲 本地WS订单簿",
         "👥 OI四象限+速率",
-        "📊 多空比矩阵",
+        "🎯 合约情绪真值",
         "🔗 Spot-Perp 价差",
         "📐 Basis+期限结构",
         "💥 爆仓中心",
@@ -1047,7 +1141,6 @@ def render_terminal():
         "⚙️ 预警规则",
         "⛓️ HL链上中心",
         "🧬 信号增强中心",
-        "📡 推送&历史数据",
         "🔧 调试",
     ])
 
@@ -1063,6 +1156,8 @@ def render_terminal():
             _scan_client = build_market_scan_client(req_timeout)
             _raw = _scan_client.fetch_market_batch(scan_coins[:20], max_workers=6)
             _mrows = build_coin_rows(_raw)
+            # P1: 存入 session_state 供「市场热力扫描」Tab 使用
+            st.session_state["last_market_scan_rows"] = _mrows
             _hot = detect_hot_coins(_mrows, top_n=5)
             if _hot:
                 render_section("🔥 热点异动币种  ·  Hot Coins Auto-Detection", kicker="Alert")
@@ -1105,6 +1200,14 @@ def render_terminal():
                 _levels = detect_price_levels(candles, sel_snap.last_price)
                 _chart_fig = build_price_levels_annotations(_chart_fig, _levels, sel_snap.last_price)
             st.plotly_chart(_chart_fig, key="pc_main", config={'displayModeBar': True, 'scrollZoom': True})
+            # P1: MACD / ATR 独立子图（仅在勾选时显示）
+            if show_macd or show_atr:
+                _macd_atr_fig = build_macd_atr_figure(candles,
+                                                       show_macd=show_macd,
+                                                       show_atr=show_atr)
+                if _macd_atr_fig:
+                    st.plotly_chart(_macd_atr_fig, key="pc_macd_atr",
+                                    config={'displayModeBar': True, 'scrollZoom': True})
         with right:
             oi_html = build_oi_change_visual(service.get_oi_history(selected_exchange))
             if oi_html: st.markdown(oi_html, unsafe_allow_html=True)
@@ -1260,37 +1363,70 @@ def render_terminal():
         st.plotly_chart(build_oi_delta_figure(oi_delta_pts), key="pc_oi_delta", config={'displayModeBar': True, 'scrollZoom': True})
         st.plotly_chart(build_oi_velocity_figure(oi_delta_pts), key="pc_oi_velocity", config={'displayModeBar': True, 'scrollZoom': True})
 
-    # ══ TAB 5: 多空比矩阵 ══
+    # ══ TAB 5: 合约情绪真值 (v8 方向1) ══
     with tabs[5]:
-        render_section("多空比矩阵  ·  Long/Short Ratio + 拥挤度", kicker="Crowd")
-        oi_binance = service.get_oi_history("binance")
-        st.plotly_chart(build_binance_oi_perp_figure(oi_binance, ls_count_data, taker_ratio_data), key="pc_binance_oi_ls", config={'displayModeBar': True, 'scrollZoom': True})
-        r1c1, r1c2, r1c3 = st.columns(3)
-        if ls_count_data:
-            ld=ls_count_data[-1]
-            with r1c1:
-                st.markdown(build_ls_gauge_html(ld.get("global_long_pct"),ld.get("global_short_pct"),label="全市场账户多空 (Binance)",top_long=ld.get("top_long_pct"),top_short=ld.get("top_short_pct")), unsafe_allow_html=True)
-                st.metric("全市场多空比", f"{ld.get('global_ratio',0):.3f}" if ld.get('global_ratio') else "-")
-        if top_trader:
-            lr_=top_trader[-1]; lsr=lr_.long_short_ratio
-            if lsr:
-                lp_=lsr/(1+lsr)*100; sp_=100-lp_
-                with r1c2:
-                    st.markdown(build_ls_gauge_html(lp_,sp_,label="大户持仓多空 (Binance Top)"), unsafe_allow_html=True)
-                    st.metric("大户持仓多空比", f"{lsr:.3f}")
-        if bybit_ratio_raw:
-            br=bybit_ratio_raw[-1].bybit_buy_ratio
-            if br:
-                with r1c3:
-                    st.markdown(build_ls_gauge_html(br*100,(1-br)*100,label="Bybit 主动买比例"), unsafe_allow_html=True)
-                    st.metric("Bybit主动买比", f"{br:.3f}")
-        st.plotly_chart(build_top_trader_figure(top_trader, global_r, bybit_ratio_raw), key="pc_ratio", config={'displayModeBar': True, 'scrollZoom': True})
-        if taker_ratio_data:
-            td=taker_ratio_data[-1]
-            tc1,tc2,tc3=st.columns(3)
-            tc1.metric("Taker主动买量",fc(td.get("buy_vol")))
-            tc2.metric("Taker主动卖量",fc(td.get("sell_vol")))
-            tc3.metric("买卖比",f"{td.get('ratio',0):.3f}" if td.get('ratio') else "-")
+        render_section(
+            "合约情绪真值层  ·  Contract Sentiment Truth",
+            "严格区分已确认 vs 未确认 | Binance 4端点并发 | Bybit Taker方向",
+            kicker="Sentiment v8"
+        )
+
+        # 数据源状态条
+        _src_cols = st.columns(4)
+        _src_cols[0].metric("Binance", "4端点 ✅ 已确认", help="globalLS / topLS账户 / topLS持仓 / takerlongshortRatio")
+        _src_cols[1].metric("Bybit", "buyRatio ✅ 已确认", help="Taker方向主动买比，非持仓比")
+        _src_cols[2].metric("OKX", "⚠️ 暂不支持", help="OKX全市场多空比API暂不稳定，已标注，不报错")
+        _src_cols[3].metric("Hyperliquid", "ℹ️ 无全市场数据", help="HL为链上去中心化，无全市场多空比端点")
+
+        # 加载当前情绪点
+        _sent_pt = load_contract_sentiment(
+            symbol_map["binance"], symbol_map["bybit"], interval, req_timeout)
+
+        # session_state 历史累积
+        if "sentiment_history" not in st.session_state:
+            st.session_state["sentiment_history"] = []
+        if _sent_pt is not None:
+            hist = st.session_state["sentiment_history"]
+            if not hist or hist[-1].timestamp_ms != _sent_pt.timestamp_ms:
+                hist.append(_sent_pt)
+                st.session_state["sentiment_history"] = hist[-200:]  # 保留最近200点
+        _sent_hist = st.session_state.get("sentiment_history", [])
+
+        # 当前情绪仪表盘
+        _gauge_col, _chart_col = st.columns([1, 2])
+        with _gauge_col:
+            st.markdown(build_sentiment_gauge_html(_sent_pt), unsafe_allow_html=True)
+            if _sent_pt:
+                st.caption(f"已确认来源：{', '.join(_sent_pt.confirmed_sources) or '等待数据…'}")
+        with _chart_col:
+            st.plotly_chart(
+                build_contract_sentiment_figure(_sent_hist),
+                key="pc_sentiment_v8", config={"displayModeBar": True})
+
+        # 详细数据表
+        if _sent_pt:
+            with st.expander("📋 原始数值详情", expanded=False):
+                _sent_rows = []
+                _data_map = [
+                    ("Binance 全市场账户多空比", _sent_pt.binance_global_ratio, "已确认"),
+                    ("Binance 全市场多头%",     _sent_pt.binance_global_long_pct, "已确认"),
+                    ("Binance 全市场空头%",     _sent_pt.binance_global_short_pct, "已确认"),
+                    ("Binance 大户账户多空比",  _sent_pt.binance_top_account_ratio, "已确认"),
+                    ("Binance 大户持仓多空比",  _sent_pt.binance_top_position_ratio, "已确认"),
+                    ("Binance Taker买比",       _sent_pt.binance_taker_buy_ratio, "已确认"),
+                    ("Binance Taker买量",       _sent_pt.binance_taker_buy_vol, "已确认"),
+                    ("Binance Taker卖量",       _sent_pt.binance_taker_sell_vol, "已确认"),
+                    ("Bybit Taker买比(非持仓)", _sent_pt.bybit_taker_buy_ratio, "已确认"),
+                    ("OKX 全市场多空比",        None, "暂不支持"),
+                    ("Hyperliquid 全市场数据",  None, "无此数据"),
+                ]
+                for name, val, status in _data_map:
+                    _sent_rows.append({
+                        "数据项": name,
+                        "数值": f"{val:.4f}" if val is not None else "—",
+                        "状态": status,
+                    })
+                st.dataframe(pd.DataFrame(_sent_rows), hide_index=True, width=600)
 
     # ══ TAB 6: Spot-Perp 价差 ══
     with tabs[6]:
@@ -1528,15 +1664,10 @@ def render_terminal():
         else:
             st.warning("signal_center.py / aggregator.py 未找到")
 
-    # ══ TAB 19: 推送 & 历史数据 ══
-    with tabs[19]:
-        if _HAS_PUSH_STORAGE:
-            render_push_settings(service)
-        else:
-            st.warning("push_settings.py / notifier.py / storage.py 未找到")
+    # ── Static tabs 19-24 are rendered OUTSIDE the fragment (see below) ──
 
-    # ══ TAB 20: 调试 ══
-    with tabs[20]:
+    # ══ TAB 19: 调试 ══
+    with tabs[19]:
         render_section("接口调试 + WS健康状态  ·  API Debug & WS Health")
 
         # WS Health Panel
@@ -1571,6 +1702,490 @@ def render_terminal():
 
 
 render_terminal()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 静态功能区 — 推送/历史/v8增强功能（不在自动刷新 fragment 内，避免表单冲突）
+# ══════════════════════════════════════════════════════════════════════════════
+
+st.markdown("---")
+st.markdown(
+    '<div class="glass-section">'
+    '<div class="glass-kicker">EXTENDED FEATURES</div>'
+    '<div class="glass-title">⚙️ 扩展功能区  ·  推送/历史/v8增强</div>'
+    '</div>', unsafe_allow_html=True)
+
+# ── 静态功能区变量安全初始化 ────────────────────────────────────────────────
+# 这些变量在 fragment 内计算，静态区用 service 重新获取或给安全默认值
+try:
+    _static_snapshots = service.current_snapshots()
+    _static_ok_snaps  = [s for s in _static_snapshots if s.status == "ok"]
+    _static_snap_by_key = dict(zip(("bybit","binance","okx","hyperliquid"), _static_snapshots))
+except Exception:
+    _static_snapshots = []
+    _static_ok_snaps  = []
+    _static_snap_by_key = {}
+
+try:
+    _sel_snap_static = _static_snap_by_key.get(selected_exchange)
+    _ref_price_static = (
+        (_sel_snap_static.last_price or _sel_snap_static.mark_price)
+        if _sel_snap_static and _sel_snap_static.status == "ok"
+        else None
+    )
+except Exception:
+    _sel_snap_static  = None
+    _ref_price_static = None
+
+try:
+    from analytics import build_oi_delta_points, build_oi_delta_summary
+    from exchanges import fetch_exchange_oi_history
+    _static_oi_pts = service.get_oi_history(selected_exchange)[-60:]
+    from models import OIPoint
+    _static_candles = st.session_state.get(f"candles_{selected_exchange}_{symbol_map.get(selected_exchange,'')}_{interval}", [])
+    _static_oi_delta = build_oi_delta_points(_static_oi_pts, _static_candles)
+except Exception:
+    _static_oi_delta = []
+
+try:
+    _static_rest_liqs = []
+    for _sek in ("bybit","binance","okx","hyperliquid"):
+        _static_rest_liqs.extend(list(service.get_liquidation_history(_sek)))
+except Exception:
+    _static_rest_liqs = []
+
+# Alias these for use in static tab code below
+ok_snaps    = _static_ok_snaps
+snap_by_key = _static_snap_by_key
+oi_delta_pts = _static_oi_delta
+ref_price   = _ref_price_static
+rest_liqs   = _static_rest_liqs
+sel_snap    = _sel_snap_static
+
+_static_tabs = st.tabs([
+    "📡 推送&历史数据",
+    "💧 现货合约分账",
+    "🔥 清算热力图2.0",
+    "🐋 鲸鱼热力图",
+    "🔐 真实持仓",
+    "⚡ 统一风险板",
+])
+
+# ══ TAB 19: 推送 & 历史数据 ══
+with _static_tabs[0]:
+    if _HAS_PUSH_STORAGE:
+        render_push_settings(service)
+    else:
+        st.warning("push_settings.py / notifier.py / storage.py 未找到")
+
+# ══ TAB 20: 现货合约分账 (v8 方向2) ══
+with _static_tabs[1]:
+    render_section(
+        "现货合约分账  ·  Spot / Perp Flow Split",
+        "三视角切换 | 多空比仅出现在合约视角 | 现货视角绝不显示全市场多空比",
+        kicker="Flow Split v8"
+    )
+    _flow_view = st.radio(
+        "视角选择", ["📦 现货视角", "📊 合约视角", "🔗 联合对照"],
+        horizontal=True, key="flow_view_v8")
+
+    # 从 service 获取对应的流数据
+    _spot_flows = []
+    _perp_flows = []
+    _combined_flows = []
+
+    try:
+        if hasattr(service, "get_spot_large_flows"):
+            _spot_flows = service.get_spot_large_flows(selected_exchange) or []
+        if hasattr(service, "get_perp_large_flows"):
+            _perp_flows = service.get_perp_large_flows(selected_exchange) or []
+    except Exception:
+        pass
+
+    # 构建 PerpFlowSnapshot 历史
+    _perp_snap_hist = []
+    for _oi_pt in service.get_oi_history(selected_exchange)[-100:]:
+        try:
+
+            _perp_snap_hist.append(PerpFlowSnapshot(
+                timestamp_ms=_oi_pt.timestamp_ms,
+                exchange=selected_exchange,
+                oi_notional=_oi_pt.open_interest_notional,
+            ))
+        except Exception:
+            pass
+
+    if _flow_view == "📦 现货视角":
+        st.info("💡 现货视角仅显示主动买卖方向和盘口数据，不包含多空比（多空比属于合约数据）")
+
+        _spot_snap_hist = []
+        for _ek_snap in service.current_snapshots():
+            if _ek_snap.exchange.lower() == selected_exchange:
+                _book = service.get_local_book(selected_exchange)
+                _sum = summarize_orderbook(
+                    service.get_local_book_levels(selected_exchange, 50)
+                    if _book.is_ready else [], sel_snap.last_price)
+                _spot_snap_hist.append(SpotFlowSnapshot(
+                    timestamp_ms=int(time.time() * 1000),
+                    exchange=selected_exchange,
+                    bid_notional=_sum.get("bid_notional"),
+                    ask_notional=_sum.get("ask_notional"),
+                    ob_imbalance_pct=_sum.get("imbalance_pct"),
+                    spread_bps=_sum.get("spread_bps"),
+                ))
+        if _spot_snap_hist:
+            st.plotly_chart(
+                build_spot_flow_figure(_spot_snap_hist),
+                key="pc_spot_flow_v8")
+        else:
+            st.info("等待现货流数据建立…")
+
+    elif _flow_view == "📊 合约视角":
+        st.info("📊 合约视角 — 包含多空比、OI变化、资金费率等合约专属指标")
+        _sent_for_perp = load_contract_sentiment(
+            symbol_map["binance"], symbol_map["bybit"], interval, req_timeout)
+        _pc1, _pc2, _pc3 = st.columns(3)
+        if _sent_for_perp:
+            gr = _sent_for_perp.binance_global_ratio
+            _pc1.metric("全市场多空比", f"{gr:.3f}" if gr else "—",
+                        help="仅合约视角显示，Binance全市场账户")
+            pr = _sent_for_perp.binance_top_position_ratio
+            _pc2.metric("大户持仓多空比", f"{pr:.3f}" if pr else "—")
+            btr = _sent_for_perp.bybit_taker_buy_ratio
+            _pc3.metric("Bybit Taker买比", f"{btr:.3f}" if btr else "—",
+                        help="Taker方向，非持仓")
+        st.plotly_chart(
+            build_perp_flow_figure(_perp_snap_hist),
+            key="pc_perp_flow_v8")
+
+    else:  # 联合对照
+        st.info("🔗 联合视图 — 现货与合约并排对比，发现价格联动信号")
+        _comb_c1, _comb_c2 = st.columns(2)
+        with _comb_c1:
+            st.plotly_chart(build_spot_flow_figure([]), key="pc_combined_spot_v8")
+        with _comb_c2:
+            st.plotly_chart(build_perp_flow_figure(_perp_snap_hist), key="pc_combined_perp_v8")
+
+# ══ TAB 21: 清算热力图2.0 (v8 方向3) ══
+with _static_tabs[2]:
+    render_section(
+        "清算热力图 2.0  ·  Liquidation Heatmap with Confidence",
+        "置信度分级：Bybit WS=1.0真实 / Binance WS=0.5可能漏单 / OKX REST=0.3仅参考 / HL=0.2推断",
+        kicker="Liq Heatmap v8"
+    )
+
+    # 置信度说明卡片
+    _conf_cols = st.columns(4)
+    _conf_data = [
+        ("Bybit WS", "1.0", "● 实心圆", "#1dc796", "真实爆仓"),
+        ("Binance WS", "0.5", "○ 空心圆", "#ffa94d", "可能漏单"),
+        ("OKX REST", "0.3", "◆ 菱形",   "#62c2ff", "仅参考"),
+        ("HL 推断",  "0.2", "✕ ×",      "#888",    "推断数据"),
+    ]
+    for col, (ex, conf, sym, color, note) in zip(_conf_cols, _conf_data):
+        col.markdown(
+            f'<div style="padding:10px;border-radius:12px;border:1px solid rgba(255,255,255,0.12);'
+            f'background:rgba(255,255,255,0.05);text-align:center;">'
+            f'<div style="font-size:0.75rem;color:#bcd;">{ex}</div>'
+            f'<div style="font-size:1.3rem;font-weight:800;color:{color};">{sym}</div>'
+            f'<div style="font-size:0.85rem;font-weight:700;color:{color};">置信度 {conf}</div>'
+            f'<div style="font-size:0.72rem;color:#888;">{note}</div>'
+            f'</div>',
+            unsafe_allow_html=True)
+
+    st.markdown("")
+
+    # 构建带置信度标签的清算事件
+    _all_liq_raw = []
+    for _ek in EXCHANGE_ORDER:
+        _all_liq_raw.extend(list(service.get_liquidation_history(_ek)))
+    _all_liq_raw.extend(rest_liqs)
+
+    _liq_with_conf = [LiquidationWithConfidence.from_event(e) for e in _all_liq_raw]
+
+    # 统计
+    if _liq_with_conf:
+        _stats_cols = st.columns(4)
+        _bybit_cnt   = sum(1 for x in _liq_with_conf if x.confidence == 1.0)
+        _binance_cnt = sum(1 for x in _liq_with_conf if 0.4 < x.confidence < 0.6)
+        _okx_cnt     = sum(1 for x in _liq_with_conf if 0.25 <= x.confidence <= 0.35)
+        _hl_cnt      = sum(1 for x in _liq_with_conf if x.confidence < 0.25)
+        _stats_cols[0].metric("Bybit真实爆仓", str(_bybit_cnt))
+        _stats_cols[1].metric("Binance爆仓(可能漏单)", str(_binance_cnt))
+        _stats_cols[2].metric("OKX爆仓(仅参考)", str(_okx_cnt))
+        _stats_cols[3].metric("HL爆仓(推断)", str(_hl_cnt))
+
+    st.plotly_chart(
+        build_liq_confidence_heatmap(
+            _liq_with_conf, ref_price=ref_price,
+            title=f"清算热力图 2.0 · {base_coin} · 置信度分级渲染"),
+        key="pc_liq_heatmap_v8", config={"displayModeBar": True})
+
+# ══ TAB 22: 鲸鱼热力图 (v8 方向4) ══
+with _static_tabs[3]:
+    render_section(
+        "鲸鱼热力图  ·  Whale Order Heatmap",
+        "三视角：现货/合约/对照图 | 拆单检测：30s内同价位±0.1%连续≥3笔标记",
+        kicker="Whale Heatmap v8"
+    )
+
+    _whale_view = st.radio(
+        "热力图视角", ["🟢 现货视角", "🔵 合约视角", "🔗 对照图"],
+        horizontal=True, key="whale_view_v8")
+
+    _view_key = {"🟢 现货视角": "spot", "🔵 合约视角": "perp", "🔗 对照图": "combined"}.get(_whale_view, "spot")
+
+    # 获取分账大单流（现货和合约独立）
+    _spot_lof = []
+    _perp_lof = []
+    try:
+        if hasattr(service, "get_spot_large_flows"):
+            _raw_spot = service.get_spot_large_flows(selected_exchange) or []
+            for _f in _raw_spot:
+
+                _spot_lof.append(SpotLargeOrderFlow(
+                    timestamp_ms=getattr(_f, "timestamp_ms", 0),
+                    exchange=getattr(_f, "exchange", selected_exchange),
+                    side=getattr(_f, "side", "buy"),
+                    price=getattr(_f, "price", 0),
+                    notional=getattr(_f, "notional", 0),
+                    is_aggressor=getattr(_f, "is_aggressor", False),
+                ))
+    except Exception:
+        pass
+
+    # 现有 large_order_flow 作为合约流（向后兼容）
+    _perp_raw = service.get_large_order_flow(selected_exchange)
+    for _f in _perp_raw:
+
+        _perp_lof.append(PerpLargeOrderFlow(
+            timestamp_ms=getattr(_f, "timestamp_ms", 0),
+            exchange=getattr(_f, "exchange", selected_exchange),
+            side=getattr(_f, "side", "buy"),
+            price=getattr(_f, "price", 0),
+            notional=getattr(_f, "notional", 0),
+            is_aggressor=getattr(_f, "is_aggressor", False),
+        ))
+
+    # 拆单检测
+    _min_notional = st.slider("拆单检测最小单笔金额($)", 5_000, 100_000, 20_000, 5_000,
+                               key="split_threshold_v8")
+    _active_flows = _spot_lof if _view_key == "spot" else _perp_lof
+    _split_clusters = []
+    if _active_flows:
+        try:
+            _split_clusters = detect_split_orders(
+                _active_flows, window_ms=30_000,
+                price_tolerance_pct=0.001, min_count=3,
+                min_notional_each=_min_notional)
+        except Exception:
+            pass
+
+    if _split_clusters:
+        st.warning(f"⚠️ 检测到 **{len(_split_clusters)}** 个疑似拆单簇（橙色圆环标记）")
+        _sc_rows = [{
+            "交易所": c.exchange, "方向": c.side,
+            "价格中心": f"{c.price_center:.2f}",
+            "笔数": c.order_count,
+            "总金额": fc(c.total_notional),
+            "持续(s)": f"{(c.last_ms - c.first_ms)/1000:.1f}",
+            "平均间隔(ms)": f"{c.avg_interval_ms:.0f}",
+        } for c in _split_clusters[:20]]
+        st.dataframe(pd.DataFrame(_sc_rows), hide_index=True)
+
+    st.plotly_chart(
+        build_whale_heatmap_figure(
+            _spot_lof, _perp_lof,
+            ref_price=ref_price,
+            view=_view_key,
+            split_clusters=_split_clusters),
+        key="pc_whale_heatmap_v8", config={"displayModeBar": True})
+
+# ══ TAB 23: 真实持仓 (v8 方向5) ══
+with _static_tabs[4]:
+    render_section(
+        "真实持仓  ·  Real Position Viewer",
+        "公开模式：HL地址分析 | 私有模式：API Key仅存Session，绝不入数据库",
+        kicker="Position v8"
+    )
+
+    _pos_mode = st.radio(
+        "查询模式",
+        ["🌐 公开模式 (HL地址)", "🔐 私有模式 (API Key)"],
+        horizontal=True, key="pos_mode_v8")
+
+    if _pos_mode == "🌐 公开模式 (HL地址)":
+        st.info("公开模式复用现有 Hyperliquid 链上地址分析。地址为公开链上数据，无需授权。")
+        _hl_addr = st.text_input(
+            "输入 HL 钱包地址 (0x...)",
+            key="hl_addr_pos_v8",
+            placeholder="0x1234...")
+        if _hl_addr and st.button("查询持仓", key="hl_pos_query"):
+            try:
+                import hl_client as _hl_cli_mod
+                _positions = _hl_cli_mod.fetch_whale_positions(_hl_addr)
+                if _positions:
+                    _pos_rows = []
+                    for _p in _positions:
+                        _pos_rows.append({
+                            "币种": getattr(_p, "coin", ""),
+                            "方向": getattr(_p, "side", ""),
+                            "数量": getattr(_p, "size", 0),
+                            "名义价值": fc(getattr(_p, "notional", None)),
+                            "开仓价": fp(getattr(_p, "entry_price", None)),
+                            "标记价": fp(getattr(_p, "mark_price", None)),
+                            "未实现盈亏": fp(getattr(_p, "unrealized_pnl", None)),
+                            "杠杆": getattr(_p, "leverage", "—"),
+                        })
+                    st.dataframe(pd.DataFrame(_pos_rows), hide_index=True)
+                else:
+                    st.info("该地址暂无持仓，或地址格式有误。")
+            except Exception as _e:
+                st.error(f"查询失败：{_e}")
+        elif not _hl_addr:
+            st.caption("HL地址分析由 hl_center.py 支持，也可前往「HL链上中心」Tab查看完整分析。")
+
+    else:
+        st.error("⚠️ 私有模式安全提示", icon="🔒")
+        st.markdown("""
+**私有模式安全规则（严格执行）：**
+- 🔑 API Key **仅存储在当前浏览器 Session**，刷新页面即清除，**绝不写入数据库**
+- 📖 强制**只读模式**，仅调用 GET 方法，不执行任何交易操作
+- 🛡️ 本地运行时数据不经过第三方服务器
+- ⚠️ 请在安全网络环境下使用，不建议在公共网络输入API Key
+        """)
+
+        if not _HAS_PRIVATE_CLIENT:
+            st.warning("private_client.py 未找到，私有模式不可用。")
+        else:
+            _api_key = st.text_input(
+                "API Key（仅存Session，不持久化）",
+                type="password", key="private_api_key_v8")
+            _api_secret = st.text_input(
+                "API Secret（仅存Session）",
+                type="password", key="private_api_secret_v8")
+            _priv_exchange = st.selectbox(
+                "交易所", ["Binance", "Bybit", "OKX"],
+                key="private_exchange_v8")
+            _passphrase = ""
+            if _priv_exchange == "OKX":
+                _passphrase = st.text_input(
+                    "OKX Passphrase（仅存Session）",
+                    type="password", key="private_passphrase_v8")
+
+            if _api_key and _api_secret and st.button("只读查询持仓", key="priv_pos_query"):
+                st.info("🔒 正在通过只读GET接口查询…API Key仅用于本次Session")
+                try:
+                    _pos_data = _private_client_mod.fetch_positions_readonly(
+                        exchange=_priv_exchange.lower(),
+                        api_key=_api_key,
+                        api_secret=_api_secret,
+                        passphrase=_passphrase,
+                    )
+                    if _pos_data:
+                        st.dataframe(pd.DataFrame(_pos_data), hide_index=True)
+                    else:
+                        st.info("暂无持仓，或API Key无效。")
+                except Exception as _e:
+                    st.error(f"查询失败：{_e}")
+
+# ══ TAB 24: 统一风险板 (v8 方向6) ══
+with _static_tabs[5]:
+    render_section(
+        "统一风险板  ·  Unified Risk Dashboard",
+        "六维雷达：Funding/基差/OI压力/清算密度/ADL保险基金/HL资产Ctx ⭐独占",
+        kicker="Risk Board v8"
+    )
+
+    # 计算 HL meta（获取HL独占数据）
+    _hl_meta = {}
+    try:
+        from exchanges import safe_float as _safe_float_ex
+        _hl_snap = snap_by_key.get("hyperliquid")
+        if _hl_snap and _hl_snap.status == "ok":
+            _hl_raw = _hl_snap.raw.get("asset_context", {})
+            _oi_cap_raw = _hl_raw.get("openInterestCap")
+            _hl_meta = {
+                "predicted_funding": _safe_float_ex(_hl_raw.get("funding")),
+                "mark_px": _hl_snap.mark_price,
+                "oracle_px": _hl_snap.index_price,
+                "at_oi_cap": (
+                    bool(_oi_cap_raw) and
+                    bool(_hl_snap.open_interest) and
+                    (_hl_snap.open_interest /
+                     max(float(_oi_cap_raw), 1)) > 0.95
+                ),
+            }
+    except Exception:
+        pass
+
+    # 构建风险雷达数据
+    _risk_pt = None
+    try:
+        _risk_pt = build_risk_radar_point(
+            coin=base_coin,
+            snapshots=ok_snaps,
+            oi_delta_pts=oi_delta_pts,
+            liq_events=liq_events,
+            hl_meta=_hl_meta,
+        )
+    except Exception as _re:
+        st.warning(f"风险数据计算异常：{_re}")
+
+    # 缓存历史
+    if "risk_history" not in st.session_state:
+        st.session_state["risk_history"] = []
+    if _risk_pt is not None:
+        _rh = st.session_state["risk_history"]
+        _rh.append(_risk_pt)
+        st.session_state["risk_history"] = _rh[-200:]
+    _risk_history = st.session_state.get("risk_history", [])
+
+    # KPI 行
+    if _risk_pt:
+        _rk_cols = st.columns(6)
+        _rk_cols[0].metric("综合风险", _risk_pt.risk_label,
+                           delta=f"{_risk_pt.composite_risk:+.3f}")
+        _rk_cols[1].metric("Funding风险", f"{_risk_pt.funding_risk:.3f}")
+        _rk_cols[2].metric("基差风险", f"{_risk_pt.basis_risk:.3f}")
+        _rk_cols[3].metric("OI压力", f"{_risk_pt.oi_pressure:.3f}")
+        _rk_cols[4].metric("清算密度", f"{_risk_pt.liq_density:.3f}")
+        _rk_cols[5].metric("HL Ctx⭐", f"{_risk_pt.hl_asset_ctx_risk:.3f}",
+                           help="Hyperliquid独占维度：预测费率+OI上限+Mark/Oracle偏差")
+
+    # HL 独占维度提示
+    if _hl_meta:
+        _hl_info_cols = st.columns(3)
+        pf = _hl_meta.get("predicted_funding")
+        _hl_info_cols[0].metric(
+            "HL 预测资金费率",
+            f"{pf * 10000:+.4f}bps" if pf else "—",
+            help="predictedFundings — HL独占，其他所无此数据")
+        at_cap = _hl_meta.get("at_oi_cap", False)
+        _hl_info_cols[1].metric(
+            "HL OI上限状态",
+            "⚠️ 已触碰上限" if at_cap else "✅ 正常",
+            help="perpsAtOpenInterestCap — HL独占")
+        mk = _hl_meta.get("mark_px"); ok_ = _hl_meta.get("oracle_px")
+        dev = abs(mk - ok_) / ok_ * 100 if mk and ok_ and ok_ > 0 else None
+        _hl_info_cols[2].metric(
+            "Mark/Oracle 偏差",
+            f"{dev:.4f}%" if dev else "—",
+            help="markPx vs oraclePx — HL独占价格偏差")
+
+    st.markdown("")
+
+    # 双图布局：雷达 + 历史趋势
+    _radar_col, _hist_col = st.columns([1, 1])
+    with _radar_col:
+        st.plotly_chart(
+            build_risk_radar_figure(_risk_pt),
+            key="pc_risk_radar_v8", config={"displayModeBar": False})
+    with _hist_col:
+        st.plotly_chart(
+            build_risk_history_figure(_risk_history),
+            key="pc_risk_history_v8", config={"displayModeBar": True})
+
 
 # Sidebar scan coins input (needs to be outside fragment)
 with st.sidebar:

@@ -24,6 +24,10 @@ _lock = threading.Lock()
 def _conn(db_path: str):
     with _lock:
         con = sqlite3.connect(db_path, check_same_thread=False, timeout=15)
+        # P2 优化：WAL 模式允许读写并发，NORMAL sync 在性能与安全间取得平衡
+        con.execute("PRAGMA journal_mode=WAL")
+        con.execute("PRAGMA synchronous=NORMAL")
+        con.execute("PRAGMA cache_size=-8000")   # 8MB 页面缓存
         con.row_factory = sqlite3.Row
         try:
             yield con

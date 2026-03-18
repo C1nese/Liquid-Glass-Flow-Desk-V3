@@ -556,3 +556,206 @@ def backtest_candle_signal(candles: List[Candle], signals: List[CandlePatternSig
         max_drawdown_pct=max_dd, sharpe=sharpe,
         from_ts=candles[0].timestamp_ms, to_ts=candles[-1].timestamp_ms,
     )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# P1 升级：可配置权重合成信号 + 市场热力矩阵
+# ══════════════════════════════════════════════════════════════════════════════
+
+# 默认合成信号权重（P1：用户可在 UI 中自定义后传入）
+DEFAULT_CS_WEIGHTS: Dict[str, float] = {
+    "price":   0.20,
+    "oi":      0.25,
+    "cvd":     0.25,
+    "funding": 0.15,
+    "crowd":   0.15,
+}
+
+
+def compute_composite_score(
+    price_score: float,
+    oi_score: float,
+    cvd_score: float,
+    funding_score: float,
+    crowd_score: float,
+    weights: Optional[Dict[str, float]] = None,
+) -> Tuple[float, float, str, str]:
+    """
+    通用加权合成信号计算器（P1：权重可由调用方传入，不再硬编码）。
+
+    返回 (composite, confidence, label, color)
+      composite  : -1.0 ~ +1.0
+      confidence : 0.0 ~ 1.0（各因子方向一致性）
+      label      : 中文信号标签
+      color      : 十六进制颜色
+    """
+    w = {**DEFAULT_CS_WEIGHTS, **(weights or {})}
+    # 归一化权重
+    w_total = sum(w.values()) or 1.0
+    wn = {k: v / w_total for k, v in w.items()}
+
+    composite = (
+        price_score   * wn.get("price",   0) +
+        oi_score      * wn.get("oi",      0) +
+        cvd_score     * wn.get("cvd",     0) +
+        funding_score * wn.get("funding", 0) +
+        crowd_score   * wn.get("crowd",   0)
+    )
+    composite = max(-1.0, min(1.0, composite))
+
+    # 置信度：有效因子方向一致性
+    scores = [price_score, oi_score, cvd_score, funding_score, crowd_score]
+    signs  = [1 if s > 0.05 else -1 if s < -0.05 else 0 for s in scores]
+    non_zero = [s for s in signs if s != 0]
+    if non_zero:
+        dominant  = max(set(non_zero), key=non_zero.count)
+        agreement = sum(1 for s in non_zero if s == dominant) / len(non_zero)
+    else:
+        agreement = 0.0
+    confidence = agreement * abs(composite)
+
+    # 标签 & 颜色
+    if composite > 0.45:
+        label, color = "偏多推进 ▲", "#1dc796"
+    elif composite < -0.45:
+        label, color = "偏空推进 ▼", "#ff6868"
+    elif abs(composite) < 0.15:
+        label, color = "盘整吸收 ≈", "#62c2ff"
+    elif composite > 0:
+        label, color = "弱多 →", "#a8ff78"
+    else:
+        label, color = "弱空 ←", "#ff9a9a"
+
+    return composite, confidence, label, color
+
+
+def build_market_heatmap(market_rows: list,
+                          metric: str = "oi_change_1h_pct") -> Optional[dict]:
+    """
+    将市场扫描数据转成热力矩阵所需的结构。
+    market_rows: 来自 exchanges.MarketScanClient.fetch_market_batch 的结果
+    metric: 热力图着色指标，可选:
+        "oi_change_1h_pct"    — OI 1h变化%
+        "funding_bps"         — 资金费率(bps)
+        "liq_1h_notional"     — 1h爆仓额
+        "vol_change_pct"      — 成交量变化%
+        "price_change_pct"    — 价格变化%
+
+    返回 {"coins": [...], "values": [...], "colors": [...], "texts": [...]}
+    供 plotly Heatmap 或 Treemap 使用
+    """
+    if not market_rows:
+        return None
+
+    metric_fn = {
+        "oi_change_1h_pct":  lambda r: getattr(r, "oi_change_1h_pct",  0) or 0,
+        "funding_bps":       lambda r: (getattr(r, "funding_rate", 0) or 0) * 10000,
+        "liq_1h_notional":   lambda r: getattr(r, "liq_1h_notional",   0) or 0,
+        "vol_change_pct":    lambda r: getattr(r, "vol_change_pct",     0) or 0,
+        "price_change_pct":  lambda r: getattr(r, "price_change_pct",  0) or 0,
+    }.get(metric)
+    if metric_fn is None:
+        return None
+
+    rows_sorted = sorted(market_rows, key=lambda r: abs(metric_fn(r)), reverse=True)
+
+    coins  = [getattr(r, "coin", "?") for r in rows_sorted]
+    values = [metric_fn(r) for r in rows_sorted]
+
+    # 颜色归一化：绿=正向/多头，红=负向/空头
+    abs_max = max(abs(v) for v in values) if values else 1
+    if abs_max == 0:
+        abs_max = 1
+
+    colors = []
+    texts  = []
+    for v in values:
+        norm = v / abs_max   # -1 ~ +1
+        if metric == "liq_1h_notional":
+            # 爆仓额越大越红
+            intensity = min(1.0, abs(v) / max(abs_max, 1))
+            r = int(255 * intensity)
+            g = int(80  * (1 - intensity))
+            b = int(80  * (1 - intensity))
+            colors.append(f"rgb({r},{g},{b})")
+            texts.append(f"${v/1e6:.2f}M" if v >= 1e6 else f"${v/1e3:.0f}K")
+        elif metric == "funding_bps":
+            # 资金费率：正=偏红（多头拥挤），负=偏蓝（空头拥挤）
+            if norm > 0:
+                intensity = min(1.0, norm)
+                colors.append(f"rgba(255,{int(100*(1-intensity))},{int(100*(1-intensity))},0.85)")
+            else:
+                intensity = min(1.0, abs(norm))
+                colors.append(f"rgba({int(100*(1-intensity))},{int(100*(1-intensity))},255,0.85)")
+            texts.append(f"{v:+.2f}bps")
+        else:
+            # 变化百分比：绿正红负
+            if norm > 0:
+                intensity = min(1.0, norm)
+                g_val = int(150 + 105 * intensity)
+                colors.append(f"rgba(29,{g_val},100,0.85)")
+            else:
+                intensity = min(1.0, abs(norm))
+                r_val = int(150 + 105 * intensity)
+                colors.append(f"rgba({r_val},50,80,0.85)")
+            texts.append(f"{v:+.2f}%")
+
+    return {"coins": coins, "values": values, "colors": colors, "texts": texts,
+            "metric": metric, "abs_max": abs_max}
+
+
+def build_market_heatmap_figure(heatmap_data: Optional[dict]) -> Optional["go.Figure"]:
+    """
+    基于 build_market_heatmap 的结果，生成 Plotly Treemap 热力图。
+    币种块面积 = abs(metric值)，颜色 = 正负方向。
+    """
+    if not heatmap_data or not heatmap_data.get("coins"):
+        return None
+
+    try:
+        import plotly.graph_objects as go
+    except ImportError:
+        return None
+
+    coins  = heatmap_data["coins"]
+    values = heatmap_data["values"]
+    colors = heatmap_data["colors"]
+    texts  = heatmap_data["texts"]
+    abs_max = heatmap_data.get("abs_max", 1)
+
+    # 面积 = abs 值归一化后 * 100（Treemap 需要正数）
+    sizes  = [max(1.0, abs(v) / abs_max * 100) for v in values]
+
+    # 每个块的标签：币种名 + 指标值
+    labels_display = [f"{c}<br>{t}" for c, t in zip(coins, texts)]
+
+    fig = go.Figure(go.Treemap(
+        labels=labels_display,
+        parents=[""] * len(coins),
+        values=sizes,
+        marker=dict(
+            colors=colors,
+            line=dict(width=1, color="rgba(255,255,255,0.12)"),
+        ),
+        textinfo="label",
+        hovertemplate="<b>%{label}</b><extra></extra>",
+        textfont=dict(size=13, color="white", family="SF Pro Display, Segoe UI, sans-serif"),
+    ))
+
+    metric_titles = {
+        "oi_change_1h_pct": "OI 1h变化% 热力图",
+        "funding_bps":      "资金费率(bps) 热力图  |  红=多头拥挤 蓝=空头拥挤",
+        "liq_1h_notional":  "1h爆仓额 热力图  |  红=强平压力大",
+        "vol_change_pct":   "成交量变化% 热力图",
+        "price_change_pct": "价格变化% 热力图",
+    }
+    title = metric_titles.get(heatmap_data["metric"], "市场热力图")
+
+    fig.update_layout(
+        height=480,
+        title=dict(text=title, x=0.02, font=dict(size=15, color="#f3f8ff")),
+        paper_bgcolor="rgba(14,22,35,0.56)",
+        margin=dict(l=10, r=10, t=50, b=10),
+        font=dict(color="#f6f9ff", family="SF Pro Display, Segoe UI, sans-serif"),
+    )
+    return fig
