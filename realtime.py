@@ -850,9 +850,34 @@ class LiveTerminalService:
                 on_message= lambda ws,msg,k=ek,s=sym: self._on_message(k,s,msg),
                 on_error  = lambda ws,err,k=ek,s=sym: self._on_error(k,s,err))
             self.ws_apps[ek] = app
-            try: app.run_forever(ping_interval=20, ping_timeout=10)
-            except Exception as e: self._on_error(ek, sym, e)
-            if self.stop_ev.wait(3): return
+            # Record connect time (safe: attribute may not exist on first run)
+            try:
+                if not hasattr(self, '_ws_connect_time'):
+                    self._ws_connect_time    = {}
+                    self._ws_disconnect_count = {k: 0 for k in EXCHANGE_ORDER}
+                    self._ws_msg_count        = {k: 0 for k in EXCHANGE_ORDER}
+                    self._ws_last_msg_ts      = {k: 0.0 for k in EXCHANGE_ORDER}
+                    self._ws_reconnect_delay  = {k: 3.0 for k in EXCHANGE_ORDER}
+                self._ws_connect_time[ek] = time.time()
+            except Exception:
+                pass
+            try:
+                app.run_forever(ping_interval=20, ping_timeout=10)
+                # Clean disconnect - reset backoff
+                if hasattr(self, '_ws_reconnect_delay'):
+                    self._ws_reconnect_delay[ek] = 3.0
+            except Exception as e:
+                self._on_error(ek, sym, e)
+            # Track disconnects and apply exponential backoff
+            try:
+                if hasattr(self, '_ws_disconnect_count'):
+                    self._ws_disconnect_count[ek] = self._ws_disconnect_count.get(ek, 0) + 1
+                delay = getattr(self, '_ws_reconnect_delay', {}).get(ek, 3.0)
+                if self.stop_ev.wait(delay): return
+                if hasattr(self, '_ws_reconnect_delay'):
+                    self._ws_reconnect_delay[ek] = min(60.0, delay * 2)
+            except Exception:
+                if self.stop_ev.wait(3): return
 
     def _run_spot_ws_worker(self, ek: str):
         while not self.stop_ev.is_set():
@@ -918,6 +943,14 @@ class LiveTerminalService:
                 {"channel":"books5","instId":coin}]}))
 
     def _on_message(self, ek: str, sym: str, message: str):
+        # Track message stats for WS health panel
+        try:
+            if hasattr(self, '_ws_msg_count'):
+                self._ws_msg_count[ek] = self._ws_msg_count.get(ek, 0) + 1
+                self._ws_last_msg_ts[ek] = time.time()
+                self._ws_reconnect_delay[ek] = 3.0
+        except Exception:
+            pass
         try: payload = json.loads(message)
         except: return
         if ek == "bybit":         self._handle_bybit(sym, payload)
@@ -1314,3 +1347,160 @@ LiveTerminalService.get_wall_life_history  = _get_wall_life_history
 LiveTerminalService.get_active_walls       = _get_active_walls
 LiveTerminalService.get_liq_collapses      = _get_liq_collapses
 LiveTerminalService.get_large_order_flow   = _get_large_order_flow
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# v6 增强 — VPIN 计算器集成 + 持久化自动归档
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _v6_init_extra(self):
+    """v6 额外状态初始化 — VPIN 计算器"""
+    try:
+        from aggregator import VPINCalculator
+        self._vpin_calcs = {
+            ek: VPINCalculator(bucket_size=500_000, n_buckets=50, exchange=ek)
+            for ek in EXCHANGE_ORDER
+        }
+    except ImportError:
+        self._vpin_calcs = {}
+
+    # 交易所主导权历史（OI份额快照）
+    from collections import deque
+    self._dominance_history = deque(maxlen=300)
+
+    # 归档开关（由主线程通过 enable_auto_archive() 控制，避免后台线程读 session_state）
+    self._archive_enabled  = False
+    self._archive_db_path  = "market_data.db"
+    self._last_archive_ts  = 0.0
+
+    # WS 健康追踪
+    self._ws_connect_time:     Dict[str, float] = {}
+    self._ws_disconnect_count: Dict[str, int]   = {ek: 0 for ek in EXCHANGE_ORDER}
+    self._ws_msg_count:        Dict[str, int]    = {ek: 0 for ek in EXCHANGE_ORDER}
+    self._ws_last_msg_ts:      Dict[str, float]  = {ek: 0.0 for ek in EXCHANGE_ORDER}
+    self._ws_reconnect_delay:  Dict[str, float]  = {ek: 3.0 for ek in EXCHANGE_ORDER}
+
+LiveTerminalService._v6_init_extra = _v6_init_extra
+
+
+def _v6_append_trade_vpin(self, ek: str, trade):
+    """VPIN 计算器接收每笔成交"""
+    calc = self._vpin_calcs.get(ek) if hasattr(self, '_vpin_calcs') else None
+    if calc:
+        try:
+            calc.add_trade(trade)
+        except Exception:
+            pass
+
+LiveTerminalService._v6_append_trade_vpin = _v6_append_trade_vpin
+
+
+def _v6_snapshot_dominance(self, snapshots):
+    """在 _sample_once 里调用，快照交易所主导权"""
+    try:
+        from aggregator import build_exchange_dominance
+        prev = self._dominance_history[-1] if self._dominance_history else None
+        dom = build_exchange_dominance(snapshots, coin="BTC", prev=prev)
+        if dom:
+            self._dominance_history.append(dom)
+    except Exception:
+        pass
+
+LiveTerminalService._v6_snapshot_dominance = _v6_snapshot_dominance
+
+
+def _v6_auto_archive(self, snapshots):
+    """每5分钟将快照写入本地数据库（如果已启用）
+    使用实例变量控制开关，避免在后台线程访问 st.session_state"""
+    import time as _time
+    now = _time.time()
+    if now - self._last_archive_ts < 300:
+        return
+    # 仅当主线程通过 enable_auto_archive() 启用后才执行
+    if not getattr(self, '_archive_enabled', False):
+        return
+    self._last_archive_ts = now
+    try:
+        db_path = getattr(self, '_archive_db_path', 'market_data.db')
+        from storage import init_db, insert_oi_from_snapshots, insert_funding_from_snapshots
+        init_db(db_path)
+        insert_oi_from_snapshots(snapshots, db_path)
+        insert_funding_from_snapshots(snapshots, db_path)
+    except Exception:
+        pass
+
+LiveTerminalService._v6_auto_archive = _v6_auto_archive
+
+def _enable_auto_archive(self, db_path: str = "market_data.db"):
+    """主线程调用，启用自动归档"""
+    self._archive_enabled = True
+    self._archive_db_path = db_path
+
+def _disable_auto_archive(self):
+    """主线程调用，禁用自动归档"""
+    self._archive_enabled = False
+
+LiveTerminalService.enable_auto_archive  = _enable_auto_archive
+LiveTerminalService.disable_auto_archive = _disable_auto_archive
+
+
+# Public getter for VPIN calculators (called from app.py signal center tab)
+def _get_vpin_calculators(self):
+    return getattr(self, '_vpin_calcs', {})
+
+def _get_ws_health(self):
+    """返回各交易所 WS 健康状态字典"""
+    now = time.time()
+    result = {}
+    for ek in EXCHANGE_ORDER:
+        last_msg = getattr(self, '_ws_last_msg_ts', {}).get(ek, 0)
+        connect_t = getattr(self, '_ws_connect_time', {}).get(ek, 0)
+        msg_count = getattr(self, '_ws_msg_count', {}).get(ek, 0)
+        disconnects = getattr(self, '_ws_disconnect_count', {}).get(ek, 0)
+        delay = getattr(self, '_ws_reconnect_delay', {}).get(ek, 3.0)
+        secs_since = now - last_msg if last_msg > 0 else 9999
+        uptime = now - connect_t if connect_t > 0 else 0
+        status = "正常" if secs_since < 10 else "延迟" if secs_since < 30 else "断线"
+        result[ek] = {
+            "status": status,
+            "secs_since_msg": round(secs_since, 1),
+            "msg_count": msg_count,
+            "disconnects": disconnects,
+            "uptime_min": round(uptime / 60, 1),
+            "reconnect_delay": delay,
+        }
+    return result
+
+def _get_dominance_history(self):
+    return list(getattr(self, '_dominance_history', []))
+
+LiveTerminalService.get_vpin_calculators   = _get_vpin_calculators
+LiveTerminalService.get_dominance_history  = _get_dominance_history
+LiveTerminalService.get_ws_health          = _get_ws_health
+
+
+# Patch __init__ to also call _v6_init_extra
+_orig_init_v6 = LiveTerminalService.__init__
+def _patched_init_v6(self, *args, **kwargs):
+    _orig_init_v6(self, *args, **kwargs)
+    self._v6_init_extra()
+LiveTerminalService.__init__ = _patched_init_v6
+
+# Patch _append_trade_locked to also feed VPIN
+_orig_trade_v6 = LiveTerminalService._append_trade_locked
+def _patched_trade_v6(self, ek, trade):
+    _orig_trade_v6(self, ek, trade)
+    self._v6_append_trade_vpin(ek, trade)
+LiveTerminalService._append_trade_locked = _patched_trade_v6
+
+# Patch _sample_once to also snapshot dominance + trigger archive
+_orig_sample_v6 = LiveTerminalService._sample_once
+def _patched_sample_v6(self):
+    _orig_sample_v6(self)
+    try:
+        snaps = self.current_snapshots()
+        self._v6_snapshot_dominance(snaps)
+        self._v6_auto_archive(snaps)
+    except Exception:
+        pass
+LiveTerminalService._sample_once = _patched_sample_v6

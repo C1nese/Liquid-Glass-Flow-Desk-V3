@@ -230,6 +230,95 @@ def build_market_conclusion(rows: List[CoinMarketRow]) -> MarketConclusion:
 # Visualizations
 # ══════════════════════════════════════════════════════════════════════════════
 
+
+def build_fear_greed_index(rows):
+    """综合计算恐慌贪婪指数 0-100。"""
+    if not rows:
+        return {"score": 50, "label": "中性", "color": "#aaaaaa", "factors": {}}
+    scores = []
+    fr_vals = [r.funding_avg for r in rows if r.funding_avg is not None]
+    if fr_vals:
+        avg_fr = sum(fr_vals) / len(fr_vals)
+        fr_score = 50 + min(50, max(-50, avg_fr * 4))
+        scores.append(("资金费率", fr_score, 0.25))
+    oi_vals = [r.oi_change_24h_pct for r in rows if r.oi_change_24h_pct is not None]
+    if oi_vals:
+        avg_oi = sum(oi_vals) / len(oi_vals)
+        oi_score = 50 + min(50, max(-50, avg_oi * 2))
+        scores.append(("OI变化", oi_score, 0.25))
+    liq_vals = [r.liq_long_pct for r in rows if r.liq_long_pct is not None]
+    if liq_vals:
+        avg_liq = sum(liq_vals) / len(liq_vals)
+        scores.append(("爆仓比", 100 - avg_liq, 0.20))
+    ls_vals = [r.long_short_ratio for r in rows if r.long_short_ratio is not None]
+    if ls_vals:
+        avg_ls = sum(ls_vals) / len(ls_vals)
+        ls_score = 50 + min(40, max(-40, (avg_ls - 1.0) * 40))
+        scores.append(("多空比", ls_score, 0.15))
+    sig_vals = [r.composite_score for r in rows if abs(r.composite_score) > 0.01]
+    if sig_vals:
+        avg_sig = sum(sig_vals) / len(sig_vals)
+        sig_score = 50 + min(45, max(-45, avg_sig * 45))
+        scores.append(("合成信号", sig_score, 0.15))
+    if not scores:
+        return {"score": 50, "label": "中性", "color": "#aaaaaa", "factors": {}}
+    total_w = sum(w for _, _, w in scores)
+    final = max(0, min(100, sum(s * w for _, s, w in scores) / total_w))
+    score = int(final)
+    if score >= 80:   label, color = "极度贪婪", "#00cc66"
+    elif score >= 60: label, color = "贪婪",     "#44cc44"
+    elif score >= 45: label, color = "中性",     "#aaaaaa"
+    elif score >= 25: label, color = "恐惧",     "#ff8833"
+    else:             label, color = "极度恐惧", "#ff4444"
+    return {"score": score, "label": label, "color": color,
+            "factors": {n: int(s) for n, s, _ in scores}}
+
+
+def build_fear_greed_html(fg):
+    """渲染恐慌贪婪指数仪表盘"""
+    import math
+    score = fg["score"]
+    label = fg["label"]
+    color = fg["color"]
+    factors = fg.get("factors", {})
+    angle = math.radians(-180 + score * 1.8)
+    cx, cy, r = 100, 90, 70
+    nx = cx + r * math.cos(angle)
+    ny = cy + r * math.sin(angle)
+    fhtml = "".join(
+        '<div style="display:flex;justify-content:space-between;margin:3px 0;">'
+        f'<span style="color:#aaa;font-size:11px;">{k}</span>'
+        f'<span style="font-size:11px;font-weight:600;color:{"#44cc44" if v>55 else "#ff8833" if v<45 else "#aaa"};">{v}</span>'
+        "</div>"
+        for k, v in factors.items()
+    )
+    arc_dash = int(score * 2.2)
+    return (
+        '<div style="background:rgba(255,255,255,0.05);border:1px solid rgba(255,255,255,0.1);'
+        'border-radius:16px;padding:16px;text-align:center;">'
+        '<div style="font-size:10px;color:#aaa;letter-spacing:0.15em;margin-bottom:8px;">'
+        "FEAR &amp; GREED INDEX · 恐慌贪婪指数</div>"
+        '<svg width="200" height="100" viewBox="0 0 200 100">'
+        "<defs><linearGradient id=\"fg-grad\" x1=\"0%\" y1=\"0%\" x2=\"100%\" y2=\"0%\">"
+        '<stop offset="0%"   stop-color="#ff4444"/>'
+        '<stop offset="25%"  stop-color="#ff8833"/>'
+        '<stop offset="50%"  stop-color="#aaaaaa"/>'
+        '<stop offset="75%"  stop-color="#44cc44"/>'
+        '<stop offset="100%" stop-color="#00cc66"/>'
+        "</linearGradient></defs>"
+        '<path d="M 30 90 A 70 70 0 0 1 170 90" fill="none" '
+        'stroke="url(#fg-grad)" stroke-width="12" stroke-linecap="round"/>'
+        f'<line x1="{cx}" y1="{cy}" x2="{nx:.1f}" y2="{ny:.1f}" '
+        f'stroke="{color}" stroke-width="3" stroke-linecap="round"/>'
+        f'<circle cx="{cx}" cy="{cy}" r="5" fill="{color}"/>'
+        f'<text x="100" y="82" text-anchor="middle" font-size="28" font-weight="800" fill="{color}">{score}</text>'
+        "</svg>"
+        f'<div style="font-size:15px;font-weight:700;color:{color};margin-top:4px;">{label}</div>'
+        f'<div style="margin-top:10px;border-top:1px solid rgba(255,255,255,0.08);padding-top:8px;">{fhtml}</div>'
+        "</div>"
+    )
+
+
 def build_market_overview_table(rows: List[CoinMarketRow]) -> pd.DataFrame:
     """Build styled DataFrame for st.dataframe"""
     data = []
@@ -486,9 +575,14 @@ def render_homepage(coins: List[str], timeout: int = 10):
     rows       = build_coin_rows(raw_data)
     anomalies  = build_anomaly_list(rows)
     conclusion = build_market_conclusion(rows)
+    fear_greed = build_fear_greed_index(rows)
 
     # ── 主结论区 ───────────────────────────────────────────────────────────────
-    st.markdown(build_conclusion_card_html(conclusion), unsafe_allow_html=True)
+    _fg_col, _cc_col = st.columns([1, 3])
+    with _fg_col:
+        st.markdown(build_fear_greed_html(fear_greed), unsafe_allow_html=True)
+    with _cc_col:
+        st.markdown(build_conclusion_card_html(conclusion), unsafe_allow_html=True)
     st.markdown('<div style="height:12px"></div>', unsafe_allow_html=True)
 
     # ── Top KPIs ───────────────────────────────────────────────────────────────
@@ -512,17 +606,17 @@ def render_homepage(coins: List[str], timeout: int = 10):
     # ── 主图区：OI排行 + 气泡图 ───────────────────────────────────────────────
     chart_l, chart_r = st.columns([1, 1.3], gap="large")
     with chart_l:
-        st.plotly_chart(build_oi_bar_chart(rows), key="hp_oi_bar", use_container_width=True)
+        st.plotly_chart(build_oi_bar_chart(rows), key="hp_oi_bar", config={'displayModeBar': True, 'scrollZoom': True})
     with chart_r:
-        st.plotly_chart(build_oi_change_bubble(rows), key="hp_bubble", use_container_width=True)
+        st.plotly_chart(build_oi_change_bubble(rows), key="hp_bubble", config={'displayModeBar': True, 'scrollZoom': True})
 
     # ── Funding热力图 + 爆仓Treemap ───────────────────────────────────────────
     f_col, t_col = st.columns([1.2, 1], gap="large")
     with f_col:
         fund_fig = build_funding_heatmap(rows)
-        st.plotly_chart(fund_fig, key="hp_funding", use_container_width=True)
+        st.plotly_chart(fund_fig, key="hp_funding", config={'displayModeBar': True, 'scrollZoom': True})
     with t_col:
-        st.plotly_chart(build_liq_treemap(rows), key="hp_liq_tree", use_container_width=True)
+        st.plotly_chart(build_liq_treemap(rows), key="hp_liq_tree", config={'displayModeBar': True, 'scrollZoom': True})
         # Lead/Lag summary
         st.markdown(
             '<div style="padding:10px 14px;border-radius:14px;'
@@ -542,7 +636,7 @@ def render_homepage(coins: List[str], timeout: int = 10):
         unsafe_allow_html=True)
 
     df = build_market_overview_table(rows)
-    st.dataframe(df, use_container_width=True, hide_index=True,
+    st.dataframe(df, width='stretch', hide_index=True,
         column_config={
             "币种":    st.column_config.TextColumn(width="small"),
             "价格":    st.column_config.NumberColumn(format="%.4f", width="small"),

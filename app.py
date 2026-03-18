@@ -27,6 +27,8 @@ from analytics import (
     build_liq_cluster_v2_figure, build_liq_cross_ex_timeline,
     build_alert_timeline_figure,
     build_replay_price_figure,
+    detect_price_levels, build_price_levels_annotations,
+    build_bull_bear_power_figure, detect_hot_coins,
 )
 from exchanges import (
     EXCHANGE_ORDER, SUPPORTED_INTERVALS, default_symbols,
@@ -43,11 +45,78 @@ from models import (
 )
 from realtime import LiveTerminalService
 
+# ── v6 增强模块 ────────────────────────────────────────────────────────────────
+try:
+    from hl_center import render_hl_center
+    _HAS_HL_CENTER = True
+except ImportError:
+    _HAS_HL_CENTER = False
+
+try:
+    from signal_center import render_signal_center, VPINCalculator
+    from aggregator import detect_arbitrage_signals, detect_funding_arbitrage
+    _HAS_SIGNAL_CENTER = True
+except ImportError:
+    _HAS_SIGNAL_CENTER = False
+
+try:
+    from push_settings import render_push_settings
+    from notifier import get_notifier, BROWSER_NOTIFICATION_JS
+    from storage import (
+        init_db, insert_oi_from_snapshots, insert_funding_from_snapshots,
+        insert_alert_history,
+    )
+    _HAS_PUSH_STORAGE = True
+except ImportError:
+    _HAS_PUSH_STORAGE = False
+
 try:
     from exchanges import fetch_binance_long_short_count, fetch_binance_taker_ratio
     _HAS_LS_COUNT = True
 except ImportError:
     _HAS_LS_COUNT = False
+
+# ── 资金费率倒计时 + 智能刷新 ─────────────────────────────────────────────────
+
+def get_funding_countdown() -> tuple:
+    """返回 (距下次结算秒数, 格式化字符串, 是否临近结算<5min)"""
+    import math
+    now_ts = time.time()
+    # Funding settles at 00:00, 08:00, 16:00 UTC every day
+    period = 8 * 3600  # 8 hours in seconds
+    next_settlement = math.ceil(now_ts / period) * period
+    secs_left = int(next_settlement - now_ts)
+    h = secs_left // 3600
+    m = (secs_left % 3600) // 60
+    s = secs_left % 60
+    is_near = secs_left < 300   # within 5 minutes
+    is_very_near = secs_left < 60
+    label = f"{h:02d}:{m:02d}:{s:02d}"
+    return secs_left, label, is_near, is_very_near
+
+def compute_smart_refresh(snapshots, base_refresh: int = 2) -> int:
+    """
+    根据市场波动自动调整刷新频率：
+    - 剧烈波动（价差大 / OI速变）→ 最快 1s
+    - 平静市场 → 最慢 5s
+    """
+    if not snapshots:
+        return base_refresh
+    # Check spread and OI velocity as volatility proxy
+    spreads = [abs(getattr(s, "spot_perp_spread_bps", 0) or 0) for s in snapshots if s.status == "ok"]
+    avg_spread = sum(spreads) / len(spreads) if spreads else 0
+
+    # High spread = volatile = faster refresh
+    if avg_spread > 20:
+        return 1
+    elif avg_spread > 8:
+        return 2
+    else:
+        # Also check funding countdown - near settlement = faster
+        secs_left, _, is_near, _ = get_funding_countdown()
+        if is_near:
+            return 1
+        return min(base_refresh, 4)
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 POPULAR_COINS = ["BTC","ETH","SOL","XRP","BNB","DOGE","ADA","SUI","AVAX",
@@ -109,8 +178,8 @@ div[data-testid="stMetric"]{background:linear-gradient(145deg,rgba(255,255,255,0
 div[data-testid="stMetric"]:hover{transform:translateY(-1px);}
 div[data-testid="stMetricLabel"]*{color:#d7e6f8!important;font-weight:600;}
 div[data-testid="stMetricValue"]{color:#fff;}
-.stTabs [data-baseweb="tab-list"]{gap:0.28rem;padding:0.28rem;margin-bottom:0.8rem;border-radius:999px;border:1px solid rgba(255,255,255,0.12);background:rgba(255,255,255,0.07);backdrop-filter:blur(24px);}
-.stTabs [data-baseweb="tab"]{height:2.3rem;border-radius:999px;color:#d3e0f2;background:transparent;font-weight:600;font-size:0.82rem;}
+.stTabs [data-baseweb="tab-list"]{gap:0.28rem;padding:0.38rem 0.28rem;margin-bottom:0.8rem;border-radius:20px;border:1px solid rgba(255,255,255,0.12);background:rgba(255,255,255,0.07);backdrop-filter:blur(24px);flex-wrap:wrap!important;height:auto!important;max-height:none!important;}
+.stTabs [data-baseweb="tab"]{height:2.3rem;border-radius:999px;color:#d3e0f2;background:transparent;font-weight:600;font-size:0.82rem;white-space:nowrap;}
 .stTabs [aria-selected="true"]{background:linear-gradient(135deg,rgba(255,255,255,0.22),rgba(255,255,255,0.10));color:#fff!important;}
 div[data-baseweb="select"]>div,.stTextInput input{background:rgba(255,255,255,0.10)!important;border:1px solid rgba(255,255,255,0.14)!important;border-radius:12px!important;color:#f8fbff!important;}
 .stButton>button{border-radius:999px;border:1px solid rgba(255,255,255,0.15);background:linear-gradient(135deg,rgba(255,255,255,0.17),rgba(255,255,255,0.08));color:#fff;backdrop-filter:blur(16px);transition:transform 220ms ease;}
@@ -121,17 +190,17 @@ div[data-testid="stAlert"]{border-radius:16px;border:1px solid rgba(255,255,255,
 
 
 # ── Cached loaders ─────────────────────────────────────────────────────────────
-@st.cache_data(ttl=15, show_spinner=False)
+@st.cache_data(ttl=15, show_spinner=False, max_entries=32)
 def load_candles(ek,sym,iv,lim,to):
     try: return fetch_exchange_candles(ek,sym,iv,lim,timeout=to)
     except: return []
 
-@st.cache_data(ttl=5, show_spinner=False)
+@st.cache_data(ttl=5, show_spinner=False, max_entries=16)
 def load_orderbook(ek,sym,lim,to):
     try: return fetch_exchange_orderbook(ek,sym,lim,timeout=to)
     except: return []
 
-@st.cache_data(ttl=90, show_spinner=False)
+@st.cache_data(ttl=90, show_spinner=False, max_entries=16)
 def load_oi_backfill(ek,sym,iv,lim,to):
     try: return fetch_exchange_oi_history(ek,sym,iv,lim,timeout=to)
     except: return []
@@ -190,6 +259,27 @@ def load_market_batch_cached(coins_tuple: tuple, timeout: int):
 
 # ── Formatters ─────────────────────────────────────────────────────────────────
 def fp(v): return "-" if v is None else f"{v:,.2f}"
+
+def load_snapshots_concurrent(clients, symbol_map, timeout=10):
+    """4所快照并发请求，带超时熔断，避免单所卡死全局"""
+    from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FutTimeout
+    results = {}
+    def _fetch(ek):
+        try:
+            sym = symbol_map.get(ek, "")
+            if not sym: return ek, None
+            return ek, clients[ek].fetch(sym)
+        except Exception as e:
+            return ek, None
+    with ThreadPoolExecutor(max_workers=4) as exe:
+        futs = {exe.submit(_fetch, ek): ek for ek in clients}
+        for fut in as_completed(futs, timeout=timeout + 2):
+            try:
+                ek, snap = fut.result(timeout=1)
+                results[ek] = snap
+            except Exception:
+                results[futs[fut]] = None
+    return results
 def fc(v):
     if v is None: return "-"
     v=float(v); av=abs(v)
@@ -271,37 +361,169 @@ def aggregate_heat_bars(levels, ref, window_pct, buckets_per_side, bars_per_side
         b["intensity"]=0 if mx<=0 else b["size"]/mx
     return all_bars
 
-def build_terminal_chart(candles, heat_bars, snapshot, interval):
-    fig = make_subplots(rows=2,cols=1,shared_xaxes=True,vertical_spacing=0.04,row_heights=[0.78,0.22])
+def _calc_ma(series, n):
+    """计算简单移动平均"""
+    return series.rolling(window=n, min_periods=1).mean()
+
+def _calc_bollinger(series, n=20, k=2.0):
+    """计算布林带：中轨/上轨/下轨"""
+    mid = series.rolling(window=n, min_periods=1).mean()
+    std = series.rolling(window=n, min_periods=1).std(ddof=0).fillna(0)
+    return mid, mid + k*std, mid - k*std
+
+def _calc_rsi(series, n=14):
+    """计算 RSI"""
+    delta = series.diff()
+    gain  = delta.clip(lower=0).rolling(n, min_periods=1).mean()
+    loss  = (-delta.clip(upper=0)).rolling(n, min_periods=1).mean()
+    rs    = gain / loss.replace(0, float("nan"))
+    return 100 - 100 / (1 + rs)
+
+def build_terminal_chart(candles, heat_bars, snapshot, interval,
+                          show_ma=True, show_bb=True, show_rsi=True,
+                          ma_periods=(5, 20, 60)):
+    """K线图 + 技术指标（MA / 布林带 / RSI） + 热力盘口"""
+    # Layout: row1=K线+指标, row2=成交量, row3=RSI（可选）
+    row_heights = [0.62, 0.18, 0.20] if show_rsi else [0.78, 0.22]
+    rows = 3 if show_rsi else 2
+    fig = make_subplots(rows=rows, cols=1, shared_xaxes=True,
+                        vertical_spacing=0.03, row_heights=row_heights)
+
     if not candles:
-        fig.add_annotation(text="没有可用K线数据",showarrow=False,x=0.5,y=0.5,xref="paper",yref="paper")
+        fig.add_annotation(text="没有可用K线数据", showarrow=False,
+                           x=0.5, y=0.5, xref="paper", yref="paper")
         return fig
-    df=pd.DataFrame({"ts":pd.to_datetime([c.timestamp_ms for c in candles],unit="ms"),
-        "o":[c.open for c in candles],"h":[c.high for c in candles],
-        "l":[c.low for c in candles],"c":[c.close for c in candles],"v":[c.volume for c in candles]})
-    up,dn="#1dc796","#ff6868"
-    fig.add_trace(go.Candlestick(x=df["ts"],open=df["o"],high=df["h"],low=df["l"],close=df["c"],
-        increasing_line_color=up,increasing_fillcolor=up,decreasing_line_color=dn,decreasing_fillcolor=dn,name="K线"),row=1,col=1)
-    vcols=[up if c>=o else dn for o,c in zip(df["o"],df["c"])]
-    fig.add_trace(go.Bar(x=df["ts"],y=df["v"],marker_color=vcols,name="成交量",opacity=0.55),row=2,col=1)
-    x_end=candles[-1].timestamp_ms+interval_to_millis(interval)
-    span=max(x_end-candles[0].timestamp_ms,interval_to_millis(interval)*20)
+
+    df = pd.DataFrame({
+        "ts": pd.to_datetime([c.timestamp_ms for c in candles], unit="ms"),
+        "o":  [c.open  for c in candles],
+        "h":  [c.high  for c in candles],
+        "l":  [c.low   for c in candles],
+        "c":  [c.close for c in candles],
+        "v":  [c.volume for c in candles],
+        "tb": [getattr(c,"taker_buy_volume",None) for c in candles],
+    })
+    up, dn = "#1dc796", "#ff6868"
+
+    # ── K线主图 ──────────────────────────────────────────────────────────────
+    fig.add_trace(go.Candlestick(
+        x=df["ts"], open=df["o"], high=df["h"], low=df["l"], close=df["c"],
+        increasing_line_color=up, increasing_fillcolor=up,
+        decreasing_line_color=dn, decreasing_fillcolor=dn,
+        name="K线", line_width=1.2), row=1, col=1)
+
+    # ── 均线 MA ──────────────────────────────────────────────────────────────
+    if show_ma:
+        ma_colors = {5: "#f8d35e", 20: "#62c2ff", 60: "#ff8c66"}
+        for p in ma_periods:
+            if len(df) >= p:
+                ma = _calc_ma(df["c"], p)
+                fig.add_trace(go.Scatter(
+                    x=df["ts"], y=ma, mode="lines", name=f"MA{p}",
+                    line=dict(color=ma_colors.get(p, "#aaa"), width=1.2, dash="solid"),
+                    opacity=0.85), row=1, col=1)
+
+    # ── 布林带 BB ─────────────────────────────────────────────────────────────
+    if show_bb and len(df) >= 20:
+        bb_mid, bb_up, bb_dn = _calc_bollinger(df["c"], 20, 2.0)
+        fig.add_trace(go.Scatter(
+            x=df["ts"], y=bb_up, mode="lines", name="BB上轨",
+            line=dict(color="rgba(180,150,255,0.6)", width=1, dash="dot"),
+            showlegend=False), row=1, col=1)
+        fig.add_trace(go.Scatter(
+            x=df["ts"], y=bb_dn, mode="lines", name="BB下轨",
+            line=dict(color="rgba(180,150,255,0.6)", width=1, dash="dot"),
+            fill="tonexty", fillcolor="rgba(150,120,255,0.05)",
+            showlegend=False), row=1, col=1)
+        fig.add_trace(go.Scatter(
+            x=df["ts"], y=bb_mid, mode="lines", name="BB中轨",
+            line=dict(color="rgba(180,150,255,0.45)", width=0.8),
+            showlegend=False), row=1, col=1)
+
+    # ── 热力盘口背景 ─────────────────────────────────────────────────────────
+    x_end  = candles[-1].timestamp_ms + interval_to_millis(interval)
+    span   = max(x_end - candles[0].timestamp_ms, interval_to_millis(interval) * 20)
     for bar in heat_bars:
-        it=bar["intensity"]; x0=int(x_end-span*(0.28+0.72*it)); ch=palette_color(str(bar["side"]),it)
-        fig.add_shape(type="rect",x0=pd.to_datetime(x0,unit="ms"),x1=pd.to_datetime(x_end,unit="ms"),
-            y0=bar["price_low"],y1=bar["price_high"],fillcolor=rgba_from_hex(ch,0.24+0.34*it),
-            line_width=0,layer="below",row=1,col=1)
-    lp=snapshot.last_price or (candles[-1].close if candles else None)
-    if lp: fig.add_hline(y=lp,line_color="#f8d35e",line_dash="dot",line_width=1,row=1,col=1)
-    if snapshot.mark_price: fig.add_hline(y=snapshot.mark_price,line_color="#8fd3ff",line_dash="dash",line_width=1,row=1,col=1)
-    sp = getattr(snapshot,'spot_price',None)
-    if sp: fig.add_hline(y=sp,line_color="#a8ff78",line_dash="dashdot",line_width=1.2,row=1,col=1)
-    fig.update_layout(height=760,margin=dict(l=12,r=12,t=62,b=12),paper_bgcolor="rgba(14,22,35,0.56)",
-        plot_bgcolor="rgba(255,255,255,0.045)",font=dict(color="#f6f9ff",family="SF Pro Display, Segoe UI, sans-serif"),
-        title=dict(text="Price Structure & Liquidity  ·  价格结构与流动性",x=0.02,y=0.98,xanchor="left",font=dict(size=19,color="#f8fbff")),
-        xaxis_rangeslider_visible=False)
-    fig.update_xaxes(showgrid=False,zeroline=False)
-    fig.update_yaxes(showgrid=True,gridcolor="rgba(255,255,255,0.08)",side="right")
+        it = bar["intensity"]
+        x0 = int(x_end - span * (0.28 + 0.72 * it))
+        ch = palette_color(str(bar["side"]), it)
+        fig.add_shape(type="rect",
+            x0=pd.to_datetime(x0, unit="ms"), x1=pd.to_datetime(x_end, unit="ms"),
+            y0=bar["price_low"], y1=bar["price_high"],
+            fillcolor=rgba_from_hex(ch, 0.24 + 0.34 * it),
+            line_width=0, layer="below", row=1, col=1)
+
+    # ── 价格参考线 ───────────────────────────────────────────────────────────
+    lp = snapshot.last_price or (candles[-1].close if candles else None)
+    if lp:
+        fig.add_hline(y=lp, line_color="#f8d35e", line_dash="dot",
+                      line_width=1.2, row=1, col=1)
+    if snapshot.mark_price:
+        fig.add_hline(y=snapshot.mark_price, line_color="#8fd3ff",
+                      line_dash="dash", line_width=1, row=1, col=1)
+    sp = getattr(snapshot, "spot_price", None)
+    if sp:
+        fig.add_hline(y=sp, line_color="#a8ff78", line_dash="dashdot",
+                      line_width=1.2, row=1, col=1)
+
+    # ── 成交量（主动买卖颜色区分）────────────────────────────────────────────
+    has_taker = df["tb"].notna().sum() > len(df) * 0.3
+    if has_taker:
+        # 已知主动买量：绿=主动买，红=主动卖
+        buy_vol  = df["tb"].fillna(0)
+        sell_vol = (df["v"] - buy_vol).clip(lower=0)
+        fig.add_trace(go.Bar(x=df["ts"], y=buy_vol,  name="主动买",
+                             marker_color="#1dc796", opacity=0.7), row=2, col=1)
+        fig.add_trace(go.Bar(x=df["ts"], y=sell_vol, name="主动卖",
+                             marker_color="#ff6868", opacity=0.7), row=2, col=1)
+    else:
+        # 用K线方向近似主动方向
+        vcols = [up if c >= o else dn for o, c in zip(df["o"], df["c"])]
+        fig.add_trace(go.Bar(x=df["ts"], y=df["v"],
+                             marker_color=vcols, name="成交量", opacity=0.6), row=2, col=1)
+
+    # ── RSI ──────────────────────────────────────────────────────────────────
+    if show_rsi and len(df) >= 14:
+        rsi = _calc_rsi(df["c"], 14)
+        rsi_colors = [
+            "#ff4444" if v >= 70 else "#44cc88" if v <= 30 else "#8888ff"
+            for v in rsi.fillna(50)
+        ]
+        fig.add_trace(go.Scatter(
+            x=df["ts"], y=rsi, mode="lines", name="RSI(14)",
+            line=dict(color="#c084fc", width=1.5)), row=3, col=1)
+        # Overbought / oversold zones
+        fig.add_hrect(y0=70, y1=100, fillcolor="rgba(255,68,68,0.07)",
+                      line_width=0, row=3, col=1)
+        fig.add_hrect(y0=0, y1=30, fillcolor="rgba(68,204,136,0.07)",
+                      line_width=0, row=3, col=1)
+        fig.add_hline(y=70, line_color="rgba(255,68,68,0.4)",
+                      line_dash="dash", line_width=0.8, row=3, col=1)
+        fig.add_hline(y=30, line_color="rgba(68,204,136,0.4)",
+                      line_dash="dash", line_width=0.8, row=3, col=1)
+        fig.add_hline(y=50, line_color="rgba(255,255,255,0.15)",
+                      line_dash="dot",  line_width=0.6, row=3, col=1)
+
+    # ── Layout ───────────────────────────────────────────────────────────────
+    chart_h = 820 if show_rsi else 720
+    fig.update_layout(
+        height=chart_h,
+        margin=dict(l=12, r=12, t=62, b=12),
+        paper_bgcolor="rgba(14,22,35,0.56)",
+        plot_bgcolor="rgba(255,255,255,0.045)",
+        font=dict(color="#f6f9ff", family="SF Pro Display, Segoe UI, sans-serif"),
+        title=dict(text="Price Structure & Liquidity  ·  价格结构与流动性",
+                   x=0.02, y=0.98, xanchor="left",
+                   font=dict(size=19, color="#f8fbff")),
+        xaxis_rangeslider_visible=False,
+        barmode="stack",
+        legend=dict(orientation="h", y=1.04, x=0.5, xanchor="center",
+                    font=dict(size=10), bgcolor="rgba(0,0,0,0)"),
+    )
+    fig.update_xaxes(showgrid=False, zeroline=False)
+    fig.update_yaxes(showgrid=True, gridcolor="rgba(255,255,255,0.08)", side="right")
+    if show_rsi:
+        fig.update_yaxes(range=[0, 100], row=3, col=1)
     return fig
 
 def build_snapshot_frame(snapshots):
@@ -554,9 +776,16 @@ with st.sidebar:
     mbo_rows       = st.slider("MBO档位", 8, 24, 14, 2)
     trade_limit    = st.slider("成交流条数", 100, 2000, 500, 100)
     ratio_limit    = st.slider("多空比历史条数", 20, 200, 80, 10)
-    refresh_secs   = st.slider("界面刷新秒数", 1, 10, 2, 1)
+    refresh_secs   = st.slider("基础刷新秒数", 1, 10, 2, 1)
+    smart_refresh  = st.checkbox("🧠 智能刷新（自动加速）", value=True, key="smart_refresh")
     sample_secs    = st.slider("持仓采样秒数", 5, 60, 15, 5)
     req_timeout    = st.slider("请求超时秒数", 5, 20, 10, 1)
+    st.markdown("---")
+    st.subheader("📊 K线技术指标")
+    show_ma  = st.checkbox("均线 MA5/20/60", value=True,  key="ind_ma")
+    show_bb  = st.checkbox("布林带 BB(20,2)", value=False, key="ind_bb")
+    show_rsi = st.checkbox("RSI(14)",         value=False, key="ind_rsi")
+    show_levels = st.checkbox("价格关口标注",  value=True,  key="show_levels")
     st.markdown("---")
     st.subheader("📡 多币种轮巡")
     watchlist_input = st.text_input("监控币种（逗号分隔）", value=",".join(WATCHLIST_DEFAULT))
@@ -581,6 +810,39 @@ symbol_map = {
     "okx":okx_sym.strip().upper(),"hyperliquid":hyper_sym.strip().upper()}
 service = resolve_service(symbol_map, req_timeout, sample_secs, restart)
 
+# ── 资金费率倒计时 ─────────────────────────────────────────────────────────────
+_fd_secs, _fd_label, _fd_near, _fd_very_near = get_funding_countdown()
+if _fd_very_near:
+    _funding_pill = f"⚠️ 结算 {_fd_label}"
+elif _fd_near:
+    _funding_pill = f"🔔 结算 {_fd_label}"
+else:
+    _funding_pill = f"💰 费率结算 {_fd_label}"
+
+# Auto-notify near settlement
+if _fd_near and _HAS_PUSH_STORAGE:
+    _notif_key = f"funding_notified_{_fd_secs // 60}"
+    if not st.session_state.get(_notif_key):
+        try:
+            get_notifier().send_raw(
+                "funding_settlement",
+                f"⏰ 资金费率即将结算！距结算还有 {_fd_label}",
+                severity="medium"
+            )
+        except Exception:
+            pass
+        st.session_state[_notif_key] = True
+
+# ── 智能刷新计算（必须在 Hero banner 之前）──────────────────────────────────────
+_smart_refresh = st.session_state.get("smart_refresh", True)
+_effective_refresh = refresh_secs
+if _smart_refresh:
+    try:
+        _snaps_for_refresh = service.current_snapshots() if service else []
+        _effective_refresh = compute_smart_refresh(_snaps_for_refresh, refresh_secs)
+    except Exception:
+        _effective_refresh = refresh_secs
+
 # ── Hero banner ───────────────────────────────────────────────────────────────
 st.markdown(f"""
 <div class="hero-shell">
@@ -590,14 +852,20 @@ st.markdown(f"""
 <div class="helper-bar">
 <div class="helper-pill">主图 {EXCHANGE_TITLES[selected_exchange]}</div>
 <div class="helper-pill">周期 {interval}</div>
-<div class="helper-pill">刷新 {refresh_secs}s</div>
+<div class="helper-pill" id="refresh-pill">刷新 {_effective_refresh}s{"⚡" if _smart_refresh and _effective_refresh < refresh_secs else ""}</div>
+<div class="helper-pill" id="funding-pill">{_funding_pill}</div>
 <div class="helper-pill">监控 {len(watchlist_coins)} 币</div>
 </div></div>""", unsafe_allow_html=True)
 
 
 # ── Main fragment ──────────────────────────────────────────────────────────────
-@st.fragment(run_every=refresh_secs)
+
+@st.fragment(run_every=_effective_refresh)
 def render_terminal():
+    # Read sidebar indicator flags from session state (set outside fragment)
+    show_ma  = st.session_state.get("ind_ma",  True)
+    show_bb  = st.session_state.get("ind_bb",  False)
+    show_rsi = st.session_state.get("ind_rsi", False)
     # Lazy-import center modules INSIDE the fragment to avoid early @st.cache_data trigger
     from homepage     import render_homepage
     from liq_center   import render_liq_center
@@ -691,6 +959,26 @@ def render_terminal():
     liq_gaps         = service.get_liquidity_gaps()
     confirmed_alerts = service.get_confirmed_alerts()
     alert_timeline   = service.get_alert_timeline()
+
+    # ── v6: 推送新确认告警到 Telegram / 浏览器 ──────────────────────────────────
+    if _HAS_PUSH_STORAGE:
+        try:
+            _notifier = get_notifier()
+            _seen_alerts = st.session_state.get("_seen_alert_ids", set())
+            _new_alerts  = [a for a in confirmed_alerts if a.alert_id not in _seen_alerts]
+            for _al in _new_alerts[-5:]:   # max 5 per refresh
+                _notifier.send_alert(_al, coin=base_coin)
+                # Write to DB
+                try:
+                    _db = getattr(service, '_archive_db_path', 'market_data.db')
+                    init_db(_db)
+                    insert_alert_history(_al.alert_type, _al.exchange, _al.severity,
+                                         _al.message, _al.score, db_path=_db)
+                except Exception:
+                    pass
+            st.session_state["_seen_alert_ids"] = _seen_alerts | {a.alert_id for a in confirmed_alerts}
+        except Exception:
+            pass
     liq_clusters_v2  = service.get_liq_clusters_v2()
     composite_sigs_by_ex = {ek: service.get_composite_signals(ek) for ek in EXCHANGE_ORDER}
     ob_quality_sel   = service.get_ob_quality_history(selected_exchange)
@@ -736,6 +1024,9 @@ def render_terminal():
         col.metric(s.exchange, fp(s.last_price), delta=delta_str)
 
     # ── Tabs ──────────────────────────────────────────────────────────────────
+    # ══ 两行 Tab 导航 ══════════════════════════════════════════════════════════
+    # 第一行：原有功能（Tab 0-16）
+    # 第二行：v6 新增功能（Tab 17-20）
     tabs = st.tabs([
         "🏠 全市场首页",
         "📈 深度终端",
@@ -754,6 +1045,9 @@ def render_terminal():
         "🌐 全市场对比",
         "📡 多币种轮巡",
         "⚙️ 预警规则",
+        "⛓️ HL链上中心",
+        "🧬 信号增强中心",
+        "📡 推送&历史数据",
         "🔧 调试",
     ])
 
@@ -762,6 +1056,25 @@ def render_terminal():
         scan_coins_raw = st.session_state.get("homepage_coins_val", ",".join(_SCAN_COINS[:25]))
         scan_coins = [c.strip().upper() for c in scan_coins_raw.split(",") if c.strip()]
         render_homepage(scan_coins, timeout=req_timeout)
+        # Hot coins detection
+        try:
+            from homepage import build_coin_rows
+            from exchanges import build_market_scan_client
+            _scan_client = build_market_scan_client(req_timeout)
+            _raw = _scan_client.fetch_market_batch(scan_coins[:20], max_workers=6)
+            _mrows = build_coin_rows(_raw)
+            _hot = detect_hot_coins(_mrows, top_n=5)
+            if _hot:
+                render_section("🔥 热点异动币种  ·  Hot Coins Auto-Detection", kicker="Alert")
+                _hc_cols = st.columns(len(_hot))
+                for _hi, _hc in enumerate(_hot):
+                    _dir_icon = "🟢" if _hc["direction"]=="bull" else "🔴" if _hc["direction"]=="bear" else "⚪"
+                    with _hc_cols[_hi]:
+                        st.metric(_hc["coin"], f"{_hc['score']:.0f}分",
+                                  delta=_hc["reason"][:30], delta_color="off")
+                        st.caption(f"{_dir_icon} {_hc['reason']}")
+        except Exception:
+            pass
 
     # ══ TAB 1: 深度终端 ══
     with tabs[1]:
@@ -782,25 +1095,31 @@ def render_terminal():
                     col=_col, lbl=latest_comp_sig.signal_label, sc=_sc,
                     conf=latest_comp_sig.confidence, fr=frate(sel_snap.funding_rate), spr=spr_str),
                 unsafe_allow_html=True)
-        render_section(f"{sel_snap.exchange} {sel_sym}", "K线 · 成交量 · OI曲线 · 盘口热力区  |  绿线=现货参考价")
+        render_section(f"{sel_snap.exchange} {sel_sym}", "K线 · 均线 · 布林带 · RSI · 盘口热力区  |  绿线=现货参考价")
         left, right = st.columns([3.1,1.35], gap="large")
         with left:
-            st.plotly_chart(build_terminal_chart(candles, heat_bars, sel_snap, interval), key="pc_main", use_container_width=True)
+            # Build chart with price level overlays
+            _chart_fig = build_terminal_chart(candles, heat_bars, sel_snap, interval,
+                                              show_ma=show_ma, show_bb=show_bb, show_rsi=show_rsi)
+            if st.session_state.get("show_levels", True) and candles and sel_snap.last_price:
+                _levels = detect_price_levels(candles, sel_snap.last_price)
+                _chart_fig = build_price_levels_annotations(_chart_fig, _levels, sel_snap.last_price)
+            st.plotly_chart(_chart_fig, key="pc_main", config={'displayModeBar': True, 'scrollZoom': True})
         with right:
             oi_html = build_oi_change_visual(service.get_oi_history(selected_exchange))
             if oi_html: st.markdown(oi_html, unsafe_allow_html=True)
             oi_fig, oi_lbl = build_oi_figure(merged_oi)
-            st.plotly_chart(oi_fig, key="pc_oi", use_container_width=True)
+            st.plotly_chart(oi_fig, key="pc_oi", config={'displayModeBar': True, 'scrollZoom': True})
             st.caption(oi_lbl)
             hf = build_heat_frame(heat_bars)
             if hf.empty: st.info("盘口深度不足，暂无热力条。")
             else:
-                st.dataframe(hf, use_container_width=True, hide_index=True,
+                st.dataframe(hf, width='stretch', hide_index=True,
                     column_config={"挂单量":st.column_config.NumberColumn(format="%.2f"),
                         "热度":st.column_config.ProgressColumn(format="%.2f",min_value=0,max_value=1),
                         "离现价%":st.column_config.NumberColumn(format="%.2f%%")})
         render_section("资金费率对比  ·  Funding Rate", "正=多头拥挤付费；负=空头拥挤付费。")
-        st.plotly_chart(build_funding_comparison_figure(ok_snaps), key="pc_funding_main", use_container_width=True)
+        st.plotly_chart(build_funding_comparison_figure(ok_snaps), key="pc_funding_main", config={'displayModeBar': True, 'scrollZoom': True})
         render_section("挂单量 + 已发生爆仓  ·  Liquidity + Executed Liquidations")
         fc4 = st.columns(4)
         fc4[0].metric(f"近{liq_window_min}m爆仓额", fc(liq_metrics.get("notional")))
@@ -808,11 +1127,11 @@ def render_terminal():
         fc4[2].metric("主导方向", liq_metrics.get("dominant") or "-")
         fc4[3].metric("四所平均费率", fbps(avg_fund))
         ll, lr = st.columns([2.1,1.35], gap="large")
-        with ll: st.plotly_chart(build_liquidation_figure(liq_events), key="pc_liq_main", use_container_width=True)
+        with ll: st.plotly_chart(build_liquidation_figure(liq_events), key="pc_liq_main", config={'displayModeBar': True, 'scrollZoom': True})
         with lr:
             lf = build_liquidation_frame(liq_events, limit=24)
             if lf.empty: st.info("暂无爆仓事件。")
-            else: st.dataframe(lf, use_container_width=True, hide_index=True,
+            else: st.dataframe(lf, width='stretch', hide_index=True,
                     column_config={"价格":st.column_config.NumberColumn(format="%.2f"),
                         "数量":st.column_config.NumberColumn(format="%.4f"),
                         "名义金额":st.column_config.NumberColumn(format="%.2f")})
@@ -823,24 +1142,76 @@ def render_terminal():
             (hcols[1],tp_hf,"推断止盈区",TP_COLORSCALE,"数据不足"),
             (hcols[2],stop_hf,"推断止损区",STOP_COLORSCALE,"数据不足")]):
             with hcol:
-                st.plotly_chart(build_heatmap_figure(fdata,title,ref_price,cs,etxt), key=f"pc_heat_{_hi}", use_container_width=True)
-                st.dataframe(build_heat_zone_frame(fdata), use_container_width=True, hide_index=True,
+                st.plotly_chart(build_heatmap_figure(fdata,title,ref_price,cs,etxt), key=f"pc_heat_{_hi}", config={'displayModeBar': True, 'scrollZoom': True})
+                st.dataframe(build_heat_zone_frame(fdata), width='stretch', hide_index=True,
                     column_config={"热度":st.column_config.ProgressColumn(format="%.2f",min_value=0,max_value=1)})
+        # ── 跨周期K线 ─────────────────────────────────────────────────────────
+        render_section("跨周期K线联动  ·  Multi-Timeframe", kicker="MTF")
+        _mtf_ivs = [iv for iv in ["5m", "15m", "1h"] if iv != interval][:2]
+        _mtf_cols = st.columns(len(_mtf_ivs))
+        for _mi, _miv in enumerate(_mtf_ivs):
+            _msym = sel_sym
+            _mc = load_candles(selected_exchange, _msym, _miv, 60, req_timeout)
+            with _mtf_cols[_mi]:
+                st.caption(f"**{_miv}** · {selected_exchange.capitalize()}")
+                if _mc:
+                    _mdf = pd.DataFrame({
+                        "ts": pd.to_datetime([c.timestamp_ms for c in _mc], unit="ms"),
+                        "o":  [c.open  for c in _mc],
+                        "h":  [c.high  for c in _mc],
+                        "l":  [c.low   for c in _mc],
+                        "c":  [c.close for c in _mc],
+                    })
+                    _mfig = go.Figure(go.Candlestick(
+                        x=_mdf["ts"], open=_mdf["o"], high=_mdf["h"],
+                        low=_mdf["l"], close=_mdf["c"],
+                        increasing_line_color="#1dc796", decreasing_line_color="#ff6868",
+                        name=_miv, line_width=1,
+                    ))
+                    _mfig.update_layout(
+                        height=240,
+                        margin=dict(l=4, r=4, t=20, b=4),
+                        paper_bgcolor="rgba(14,22,35,0.56)",
+                        plot_bgcolor="rgba(255,255,255,0.045)",
+                        font=dict(color="#f6f9ff", size=10),
+                        xaxis_rangeslider_visible=False,
+                        showlegend=False,
+                    )
+                    # Add MA20 to MTF charts
+                    _mclose = _mdf["c"]
+                    if len(_mclose) >= 20:
+                        _mma = _mclose.rolling(20).mean()
+                        _mfig.add_trace(go.Scatter(
+                            x=_mdf["ts"], y=_mma, mode="lines",
+                            line=dict(color="#62c2ff", width=1), name="MA20",
+                        ))
+                    st.plotly_chart(_mfig, key=f"pc_mtf_{_miv}",
+                                    config={"displayModeBar": False})
+                else:
+                    st.info(f"无 {_miv} 数据")
+
         render_section("MBO Profile  ·  盘口队列画像")
         ml, mr = st.columns([2.1,1.35], gap="large")
-        with ml: st.plotly_chart(build_mbo_figure(mbo_frame, ref_price), key="pc_mbo", use_container_width=True)
+        with ml: st.plotly_chart(build_mbo_figure(mbo_frame, ref_price), key="pc_mbo", config={'displayModeBar': True, 'scrollZoom': True})
         with mr:
             if mbo_frame.empty: st.info("盘口深度不足。")
             else: st.dataframe(mbo_frame[["方向","价格","挂单量","名义金额","盘口占比","吸收分数"]],
-                use_container_width=True, hide_index=True,
+                width='stretch', hide_index=True,
                 column_config={"价格":st.column_config.NumberColumn(format="%.2f"),
                     "盘口占比":st.column_config.ProgressColumn(format="%.2f",min_value=0,max_value=1),
                     "吸收分数":st.column_config.ProgressColumn(format="%.2f",min_value=0,max_value=1)})
 
     # ══ TAB 2: CVD ══
     with tabs[2]:
-        render_section("CVD 累积成交量差  ·  Cumulative Volume Delta", kicker="Flow")
-        st.plotly_chart(build_cvd_figure(cvd_points, f"{base_coin} CVD"), key="pc_cvd", use_container_width=True)
+        render_section("CVD 累积成交量差 + 多空力量面板  ·  Bull/Bear Power", kicker="Flow")
+        st.plotly_chart(build_cvd_figure(cvd_points, f"{base_coin} CVD"), key="pc_cvd", config={'displayModeBar': True, 'scrollZoom': True})
+
+        # Bull/Bear Power Panel
+        render_section("多空力量实时面板  ·  Bull/Bear Power", kicker="Power")
+        _ob_levels_dict = {ek: service.get_local_book_levels(ek, 30) for ek in EXCHANGE_ORDER}
+        _cvd_hist_dict  = {ek: service.get_cvd_history(ek) for ek in EXCHANGE_ORDER}
+        _bb_fig = build_bull_bear_power_figure(snapshots, _ob_levels_dict, _cvd_hist_dict)
+        st.plotly_chart(_bb_fig, key="pc_bb_power", config={'displayModeBar': True, 'scrollZoom': True})
         if unique_trades:
             tc1, tc2 = st.columns([1.6,1])
             with tc1:
@@ -848,7 +1219,7 @@ def render_terminal():
                     "方向":"主动买▲" if t.side=="buy" else "主动卖▼",
                     "价格":t.price,"数量":t.size,"名义金额":t.notional,"交易所":t.exchange}
                     for t in sorted(unique_trades,key=lambda x:x.timestamp_ms,reverse=True)[:50]]
-                st.dataframe(pd.DataFrame(trows), use_container_width=True, hide_index=True,
+                st.dataframe(pd.DataFrame(trows), width='stretch', hide_index=True,
                     column_config={"价格":st.column_config.NumberColumn(format="%.2f"),
                         "数量":st.column_config.NumberColumn(format="%.4f"),
                         "名义金额":st.column_config.NumberColumn(format="%.2f")})
@@ -875,7 +1246,7 @@ def render_terminal():
         bk_c[4].metric("现货WS",
             "Bybit{} OKX{}".format("✅" if spot_bybit and spot_bybit.is_ready else "⏳",
                                     "✅" if spot_okx   and spot_okx.is_ready   else "⏳"))
-        st.plotly_chart(build_local_book_figure(local_book, depth=min(depth_limit,50)), key="pc_localbook", use_container_width=True)
+        st.plotly_chart(build_local_book_figure(local_book, depth=min(depth_limit,50)), key="pc_localbook", config={'displayModeBar': True, 'scrollZoom': True})
 
     # ══ TAB 4: OI四象限 ══
     with tabs[4]:
@@ -886,14 +1257,14 @@ def render_terminal():
         oi_cols[2].metric("空头回补", f"{oi_delta_summ.get('short_cover_pct',0):.1f}%")
         oi_cols[3].metric("多头减仓", f"{oi_delta_summ.get('long_unwind_pct',0):.1f}%")
         oi_cols[4].metric("平均OI速率/min", fc(oi_delta_summ.get("avg_velocity")))
-        st.plotly_chart(build_oi_delta_figure(oi_delta_pts), key="pc_oi_delta", use_container_width=True)
-        st.plotly_chart(build_oi_velocity_figure(oi_delta_pts), key="pc_oi_velocity", use_container_width=True)
+        st.plotly_chart(build_oi_delta_figure(oi_delta_pts), key="pc_oi_delta", config={'displayModeBar': True, 'scrollZoom': True})
+        st.plotly_chart(build_oi_velocity_figure(oi_delta_pts), key="pc_oi_velocity", config={'displayModeBar': True, 'scrollZoom': True})
 
     # ══ TAB 5: 多空比矩阵 ══
     with tabs[5]:
         render_section("多空比矩阵  ·  Long/Short Ratio + 拥挤度", kicker="Crowd")
         oi_binance = service.get_oi_history("binance")
-        st.plotly_chart(build_binance_oi_perp_figure(oi_binance, ls_count_data, taker_ratio_data), key="pc_binance_oi_ls", use_container_width=True)
+        st.plotly_chart(build_binance_oi_perp_figure(oi_binance, ls_count_data, taker_ratio_data), key="pc_binance_oi_ls", config={'displayModeBar': True, 'scrollZoom': True})
         r1c1, r1c2, r1c3 = st.columns(3)
         if ls_count_data:
             ld=ls_count_data[-1]
@@ -913,7 +1284,7 @@ def render_terminal():
                 with r1c3:
                     st.markdown(build_ls_gauge_html(br*100,(1-br)*100,label="Bybit 主动买比例"), unsafe_allow_html=True)
                     st.metric("Bybit主动买比", f"{br:.3f}")
-        st.plotly_chart(build_top_trader_figure(top_trader, global_r, bybit_ratio_raw), key="pc_ratio", use_container_width=True)
+        st.plotly_chart(build_top_trader_figure(top_trader, global_r, bybit_ratio_raw), key="pc_ratio", config={'displayModeBar': True, 'scrollZoom': True})
         if taker_ratio_data:
             td=taker_ratio_data[-1]
             tc1,tc2,tc3=st.columns(3)
@@ -937,18 +1308,18 @@ def render_terminal():
                 "✅" if service._spot_price.get("bybit") else "⏳",
                 "✅" if service._spot_price.get("okx")   else "⏳",
                 "✅" if service._spot_price.get("binance") else "⏳"))
-        st.plotly_chart(build_spot_perp_realtime_figure(spread_hist_all), key="pc_spread_rt", use_container_width=True)
+        st.plotly_chart(build_spot_perp_realtime_figure(spread_hist_all), key="pc_spread_rt", config={'displayModeBar': True, 'scrollZoom': True})
         render_section("Spot-Perp 实时告警", kicker="Alerts")
         render_spot_perp_alerts(sp_alerts)
 
     # ══ TAB 7: Basis ══
     with tabs[7]:
         render_section("Basis 合约溢价率  ·  Spot vs Futures Basis", kicker="Basis")
-        st.plotly_chart(build_basis_figure(ok_snaps, spot_prices), key="pc_basis", use_container_width=True)
+        st.plotly_chart(build_basis_figure(ok_snaps, spot_prices), key="pc_basis", config={'displayModeBar': True, 'scrollZoom': True})
         render_section("期限结构  ·  Term Structure", kicker="Term")
-        st.plotly_chart(build_term_structure_figure(futures_oi_list), key="pc_term", use_container_width=True)
+        st.plotly_chart(build_term_structure_figure(futures_oi_list), key="pc_term", config={'displayModeBar': True, 'scrollZoom': True})
         render_section("现货 vs 合约持仓  ·  Spot Volume vs Perp OI", kicker="SpotPerp")
-        st.plotly_chart(build_spot_vs_perp_figure(ok_snaps, spot_volumes), key="pc_spotperp", use_container_width=True)
+        st.plotly_chart(build_spot_vs_perp_figure(ok_snaps, spot_volumes), key="pc_spotperp", config={'displayModeBar': True, 'scrollZoom': True})
 
     # ══ TAB 8: 爆仓中心 ══
     with tabs[8]:
@@ -957,12 +1328,12 @@ def render_terminal():
     # ══ TAB 9: 冰山单+缺口 ══
     with tabs[9]:
         render_section("冰山单检测  ·  Iceberg Order Detection", kicker="Iceberg")
-        st.plotly_chart(build_iceberg_figure(iceberg_alerts), key="pc_iceberg", use_container_width=True)
+        st.plotly_chart(build_iceberg_figure(iceberg_alerts), key="pc_iceberg", config={'displayModeBar': True, 'scrollZoom': True})
         render_section("流动性缺口  ·  Liquidity Gap", kicker="Gap")
         gap_df = build_liquidity_gap_frame(liq_gaps)
         if gap_df.empty: st.info("暂未检测到流动性缺口（需WebSocket订单簿建立后开始检测）。")
         else:
-            st.dataframe(gap_df, use_container_width=True, hide_index=True,
+            st.dataframe(gap_df, width='stretch', hide_index=True,
                 column_config={"消失比例":st.column_config.ProgressColumn(format="%.0%",min_value=0,max_value=1),
                     "前挂单":st.column_config.NumberColumn(format="%.0f"),
                     "后挂单":st.column_config.NumberColumn(format="%.0f")})
@@ -987,7 +1358,7 @@ def render_terminal():
             else: sc_col.metric(EXCHANGE_TITLES.get(ek,ek), "等待数据…")
         if latest_comp_sig:
             st.markdown(build_composite_radar_html(latest_comp_sig), unsafe_allow_html=True)
-        st.plotly_chart(build_composite_signal_figure(composite_sigs_by_ex), key="pc_composite", use_container_width=True)
+        st.plotly_chart(build_composite_signal_figure(composite_sigs_by_ex), key="pc_composite", config={'displayModeBar': True, 'scrollZoom': True})
         if latest_comp_sig:
             factor_rows=[
                 {"因子":"价格动能","得分":f"{latest_comp_sig.price_score:+.3f}","权重":"20%"},
@@ -997,7 +1368,7 @@ def render_terminal():
                 {"因子":"拥挤度","得分":f"{latest_comp_sig.crowd_score:+.3f}","权重":"15%"},
                 {"因子":"合成总分","得分":f"{latest_comp_sig.composite_score:+.3f}","权重":"100%"},
             ]
-            st.dataframe(pd.DataFrame(factor_rows), use_container_width=True, hide_index=True)
+            st.dataframe(pd.DataFrame(factor_rows), width='stretch', hide_index=True)
 
     # ══ TAB 11: 盘口中心 ══
     with tabs[11]:
@@ -1038,19 +1409,19 @@ def render_terminal():
             speed = st.select_slider("回放速度", options=["1x","5x","20x"], value="1x")
             step  = {"1x":1,"5x":5,"20x":20}.get(speed,1)
             frames_to_show = list(recorded_frames)[::step][-300:]
-            st.plotly_chart(build_replay_price_figure(frames_to_show, speed), key="pc_replay", use_container_width=True)
+            st.plotly_chart(build_replay_price_figure(frames_to_show, speed), key="pc_replay", config={'displayModeBar': True, 'scrollZoom': True})
 
     # ══ TAB 14: 全市场对比 ══
     with tabs[14]:
         render_section("全市场对比  ·  Cross-Exchange Snapshot", "Binance排首位")
         ordered_snaps = sorted(snapshots, key=lambda s: 0 if s.exchange=="Binance" else 1)
-        st.dataframe(build_snapshot_frame(ordered_snaps), use_container_width=True, hide_index=True,
+        st.dataframe(build_snapshot_frame(ordered_snaps), width='stretch', hide_index=True,
             column_config={"最新价":st.column_config.NumberColumn(format="%.2f"),
                 "现货价":st.column_config.NumberColumn(format="%.2f"),
                 "现货-合约(bps)":st.column_config.NumberColumn(format="%.2f"),
                 "持仓金额":st.column_config.NumberColumn(format="%.0f"),
                 "费率bps":st.column_config.NumberColumn(format="%.4f")})
-        st.plotly_chart(build_funding_comparison_figure(ok_snaps), key="pc_funding_compare", use_container_width=True)
+        st.plotly_chart(build_funding_comparison_figure(ok_snaps), key="pc_funding_compare", config={'displayModeBar': True, 'scrollZoom': True})
 
     # ══ TAB 15: 多币种轮巡 ══
     with tabs[15]:
@@ -1069,7 +1440,7 @@ def render_terminal():
                     else: wrows.append({"币种":coin,"最新价":None,"持仓金额":None,"资金费率bps":None,"24h成交额":None,"状态":"❌"})
                 except: wrows.append({"币种":coin,"最新价":None,"持仓金额":None,"资金费率bps":None,"24h成交额":None,"状态":"⚠️"})
             if wrows:
-                st.dataframe(pd.DataFrame(wrows), use_container_width=True, hide_index=True,
+                st.dataframe(pd.DataFrame(wrows), width='stretch', hide_index=True,
                     column_config={"最新价":st.column_config.NumberColumn(format="%.4f"),
                         "持仓金额":st.column_config.NumberColumn(format="%.0f"),
                         "资金费率bps":st.column_config.NumberColumn(format="%.4f"),
@@ -1114,12 +1485,78 @@ def render_terminal():
             arows=[{"触发时间":pd.to_datetime(e.triggered_at_ms,unit="ms"),"规则":e.name,
                 "交易所":EXCHANGE_TITLES.get(e.exchange,e.exchange),"实际值":e.actual_value,"消息":e.message}
                 for e in reversed(list(alert_events)[-50:])]
-            st.dataframe(pd.DataFrame(arows), use_container_width=True, hide_index=True,
+            st.dataframe(pd.DataFrame(arows), width='stretch', hide_index=True,
                 column_config={"实际值":st.column_config.NumberColumn(format="%.4g")})
 
-    # ══ TAB 17: 调试 ══
+    # ══ TAB 17: HL 链上中心 ══
     with tabs[17]:
-        render_section("接口调试  ·  API Debug")
+        if _HAS_HL_CENTER:
+            render_hl_center()
+        else:
+            st.warning("hl_center.py 未找到，请确认文件已放置在同目录")
+
+    # ══ TAB 18: 信号增强中心 ══
+    with tabs[18]:
+        if _HAS_SIGNAL_CENTER:
+            candles_by_ex = {}
+            for ek in EXCHANGE_ORDER:
+                syms = default_symbols(base_coin)
+                ck = f"candles_{ek}_{syms.get(ek,'')}_{interval}"
+                if ck in st.session_state:
+                    candles_by_ex[ek] = st.session_state[ck]
+            vpin_calcs = service.get_vpin_calculators() if hasattr(service, 'get_vpin_calculators') else {}
+            all_liq = []
+            for ek in EXCHANGE_ORDER:
+                all_liq.extend(list(service.get_liquidation_history(ek)))
+            ob_spread_h = {s.exchange: [float(s.spot_perp_spread_bps or 0)] for s in snapshots if s.status=="ok"}
+            ob_depth_h = {}
+            for ek in EXCHANGE_ORDER:
+                book = service.get_local_book(ek)
+                if book and book.is_ready:
+                    levels = book.to_levels(20)
+                    bid_depth = sum(l.price * l.size for l in levels if l.side == "bid")
+                    ob_depth_h[ek] = [bid_depth]
+            render_signal_center(
+                snapshots=snapshots,
+                candles_by_exchange=candles_by_ex,
+                vpin_calculators=vpin_calcs,
+                liq_events=all_liq,
+                ob_spread_hist=ob_spread_h,
+                ob_depth_hist=ob_depth_h,
+                dominance_history=service.get_dominance_history() if hasattr(service, 'get_dominance_history') else [],
+            )
+        else:
+            st.warning("signal_center.py / aggregator.py 未找到")
+
+    # ══ TAB 19: 推送 & 历史数据 ══
+    with tabs[19]:
+        if _HAS_PUSH_STORAGE:
+            render_push_settings(service)
+        else:
+            st.warning("push_settings.py / notifier.py / storage.py 未找到")
+
+    # ══ TAB 20: 调试 ══
+    with tabs[20]:
+        render_section("接口调试 + WS健康状态  ·  API Debug & WS Health")
+
+        # WS Health Panel
+        st.markdown("#### 📡 WebSocket 健康状态")
+        if hasattr(service, "get_ws_health"):
+            ws_health = service.get_ws_health()
+            wh_cols = st.columns(4)
+            for ci, (ek, info) in enumerate(ws_health.items()):
+                status_icon = "🟢" if info["status"] == "正常" else "🟡" if info["status"] == "延迟" else "🔴"
+                with wh_cols[ci]:
+                    st.markdown(f"**{ek.capitalize()}** {status_icon}")
+                    st.caption(f"状态: {info['status']}")
+                    st.caption(f"最后消息: {info['secs_since_msg']:.1f}s前")
+                    st.caption(f"消息总数: {info['msg_count']:,}")
+                    st.caption(f"断线次数: {info['disconnects']}")
+                    st.caption(f"运行时间: {info['uptime_min']:.1f}min")
+                    if info['reconnect_delay'] > 3:
+                        st.caption(f"⚠️ 退避延迟: {info['reconnect_delay']:.0f}s")
+
+        st.markdown("---")
         st.write(f"主图: `{sel_snap.exchange}` | 合约: `{sel_sym}`")
         st.write(f"WS订单簿: `{'已建立' if local_book.is_ready else '初始化中'}` | OI点数: `{len(service.get_oi_history(selected_exchange))}` | WS成交: `{len(ws_trades)}`")
         st.write(f"已确认告警: `{len(confirmed_alerts)}` | 爆仓簇v2: `{len(liq_clusters_v2)}` | 录制帧: `{len(recorded_frames)}`")
@@ -1137,6 +1574,40 @@ render_terminal()
 
 # Sidebar scan coins input (needs to be outside fragment)
 with st.sidebar:
+    st.markdown("---")
+    st.subheader("⭐ 自选收藏")
+    # Persistent favorites via session_state (survives rerun within session)
+    if "favorites" not in st.session_state:
+        st.session_state["favorites"] = ["BTC", "ETH", "SOL"]
+    fav_input = st.text_input(
+        "收藏币种（逗号分隔）",
+        value=",".join(st.session_state["favorites"]),
+        key="fav_input",
+    )
+    if fav_input:
+        st.session_state["favorites"] = [c.strip().upper() for c in fav_input.split(",") if c.strip()]
+    fav_coins = st.session_state["favorites"]
+    if fav_coins:
+        fav_cols = st.columns(min(5, len(fav_coins)))
+        for i, coin in enumerate(fav_coins[:5]):
+            if fav_cols[i].button(coin, key=f"fav_btn_{coin}"):
+                st.session_state["base_coin_val"] = coin
+                st.rerun()
+
+    st.markdown("---")
+    st.subheader("🔇 全局静音")
+    global_mute = st.checkbox(
+        "静音所有声音告警",
+        value=st.session_state.get("global_mute", False),
+        key="global_mute_cb",
+    )
+    st.session_state["global_mute"] = global_mute
+    # Inject mute state into browser
+    st.markdown(
+        f"<script>window._globalMuted = {'true' if global_mute else 'false'};</script>",
+        unsafe_allow_html=True,
+    )
+
     st.markdown("---")
     st.subheader("🏠 首页扫描币种")
     hp_coins = st.text_input(

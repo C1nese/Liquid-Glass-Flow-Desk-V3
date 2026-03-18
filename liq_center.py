@@ -106,7 +106,7 @@ def build_single_vs_cross_figure(clusters: List[LiquidationClusterV2]) -> go.Fig
         dom = [c.dominant_side for c in group]
         col = [_DN if d=="long" else _UP for d in dom]
         exc = ["+".join(sorted(c.exchanges)) for c in group]
-        txt = [f"{nm}<br>${_fc(n)}<br>{ex}<br>瀑布{c.cascade_score:.2f}"
+        txt = [f"{name}<br>${_fc(n)}<br>{ex}<br>瀑布{c.cascade_score:.2f}"
                for n, ex, c in zip(ns, exc, group)]
         fig.add_trace(go.Scatter(x=ts, y=ns, mode="markers", name=name,
             marker=dict(size=szs, color=col, symbol=symbol, opacity=0.9,
@@ -210,20 +210,20 @@ def render_liq_center(liq_by_exchange: Dict, clusters: List, coin: str = "BTC"):
     kc[4].metric("跨所联动簇", str(sum(1 for c in clusters if c.cross_exchange)))
 
     # ── Window summary bars ────────────────────────────────────────────────────
-    st.plotly_chart(build_window_summary_bars(summaries), key="lc_window_bars", use_container_width=True)
+    st.plotly_chart(build_window_summary_bars(summaries), key="lc_window_bars", config={'displayModeBar': True, 'scrollZoom': True})
 
     # ── View 1: Long vs Short split ────────────────────────────────────────────
     st.markdown("#### 视角1：多头爆仓 vs 空头爆仓")
-    st.plotly_chart(build_long_short_split_figure(liq_by_exchange), key="lc_ls_split", use_container_width=True)
+    st.plotly_chart(build_long_short_split_figure(liq_by_exchange), key="lc_ls_split", config={'displayModeBar': True, 'scrollZoom': True})
 
     # ── View 2+3: Single vs Cross + Timeline ──────────────────────────────────
     v2l, v2r = st.columns(2, gap="large")
     with v2l:
         st.markdown("#### 视角2：单所 vs 跨所联动")
-        st.plotly_chart(build_single_vs_cross_figure(clusters), key="lc_cross", use_container_width=True)
+        st.plotly_chart(build_single_vs_cross_figure(clusters), key="lc_cross", config={'displayModeBar': True, 'scrollZoom': True})
     with v2r:
         st.markdown("#### 视角3：连续爆仓簇时间轴")
-        st.plotly_chart(build_cascade_timeline_figure(liq_by_exchange, clusters), key="lc_cascade", use_container_width=True)
+        st.plotly_chart(build_cascade_timeline_figure(liq_by_exchange, clusters), key="lc_cascade", config={'displayModeBar': True, 'scrollZoom': True})
 
     # ── View 4: Per-exchange breakdown table ──────────────────────────────────
     st.markdown("#### 视角4：各所爆仓明细")
@@ -239,7 +239,7 @@ def render_liq_center(liq_by_exchange: Dict, clusters: List, coin: str = "BTC"):
                 "多头爆仓": ln, "空头爆仓": sn, "总计": ln+sn,
                 "多头占%": round(ln/(max(ln+sn,1))*100, 1)})
     if tbl_rows:
-        st.dataframe(pd.DataFrame(tbl_rows), use_container_width=True, hide_index=True,
+        st.dataframe(pd.DataFrame(tbl_rows), width='stretch', hide_index=True,
             column_config={"多头爆仓": st.column_config.NumberColumn(format="%.0f"),
                 "空头爆仓": st.column_config.NumberColumn(format="%.0f"),
                 "总计": st.column_config.NumberColumn(format="%.0f"),
@@ -258,6 +258,6 @@ def render_liq_center(liq_by_exchange: Dict, clusters: List, coin: str = "BTC"):
             "瀑布分": f"{c.cascade_score:.2f}",
             "主导": "多头" if c.dominant_side=="long" else "空头",
         } for c in sorted(clusters, key=lambda c: c.start_ms, reverse=True)[:30]]
-        st.dataframe(pd.DataFrame(cluster_rows), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(cluster_rows), width='stretch', hide_index=True)
     else:
         st.info("暂无爆仓簇（连续30s内超过$10万的多笔爆仓才触发）")

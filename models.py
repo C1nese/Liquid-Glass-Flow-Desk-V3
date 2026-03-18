@@ -630,3 +630,237 @@ class MultiExchangeLiqSummary:
     cross_ex_cluster_count: int
     dominant_side: str
     peak_cluster_notional: float
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# v6 增强 — Hyperliquid 专属 / 跨所聚合 / 信号层 / 推送 / 持久化
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ── Hyperliquid 鲸鱼账户 ──────────────────────────────────────────────────────
+@dataclass
+class HLWhalePosition:
+    """Hyperliquid 链上大户持仓"""
+    address: str
+    coin: str
+    side: str               # "long" / "short"
+    size: float
+    notional: float
+    entry_price: Optional[float]
+    mark_price: Optional[float]
+    unrealized_pnl: Optional[float]
+    leverage: Optional[float]
+    margin_used: Optional[float]
+    timestamp_ms: int
+
+@dataclass
+class HLLeaderEntry:
+    """Hyperliquid 排行榜条目"""
+    rank: int
+    address: str
+    display_name: str
+    pnl_30d: Optional[float]
+    roi_30d: Optional[float]
+    volume_30d: Optional[float]
+    win_rate: Optional[float]
+    current_positions: List["HLWhalePosition"] = field(default_factory=list)
+
+@dataclass
+class HLPredictedFunding:
+    """Hyperliquid 预测资金费率（下一期）"""
+    coin: str
+    predicted_rate: float       # 原始费率
+    predicted_rate_bps: float   # bps
+    current_rate: float
+    current_rate_bps: float
+    rate_delta_bps: float       # 预测 - 当前
+    timestamp_ms: int
+
+@dataclass
+class HLVaultInfo:
+    """Hyperliquid Vault 信息"""
+    vault_address: str
+    name: str
+    leader: str
+    tvl: float
+    apr_30d: Optional[float]
+    follower_count: int
+    net_inflow_24h: float       # 正=流入 负=流出
+    pnl_30d: Optional[float]
+    description: str = ""
+    timestamp_ms: int = 0
+
+@dataclass
+class HLLiquidationDensity:
+    """链上清算价格密度点"""
+    price: float
+    long_notional: float        # 在此价位的多头清算金额
+    short_notional: float
+    total_notional: float
+    address_count: int
+
+# ── 跨所聚合 ─────────────────────────────────────────────────────────────────
+@dataclass
+class CrossExArbitrageSignal:
+    """跨所套利信号"""
+    coin: str
+    timestamp_ms: int
+    high_exchange: str
+    low_exchange: str
+    high_price: float
+    low_price: float
+    spread_bps: float
+    arbitrage_pct: float
+    severity: str               # "low" / "medium" / "high"
+
+@dataclass
+class CrossExFundingArb:
+    """跨所资金费率套利信号"""
+    coin: str
+    timestamp_ms: int
+    long_exchange: str          # 在此所做多（费率低/负）
+    short_exchange: str         # 在此所做空（费率高/正）
+    long_rate_bps: float
+    short_rate_bps: float
+    net_rate_bps: float         # 每期净收益 bps
+    annual_yield_pct: float     # 年化收益率估算
+    severity: str
+
+@dataclass
+class AggregatedOIPoint:
+    """聚合OI点（4所加权）"""
+    timestamp_ms: int
+    coin: str
+    total_notional: float
+    by_exchange: Dict[str, float]       # exchange -> notional
+    dominant_exchange: str
+    dominant_pct: float
+
+@dataclass
+class ExchangeDominancePoint:
+    """交易所市场份额动态"""
+    timestamp_ms: int
+    coin: str
+    oi_shares: Dict[str, float]         # exchange -> pct
+    vol_shares: Dict[str, float]
+    oi_shift: Dict[str, float]          # 相比上一快照的OI变化
+
+# ── 信号层 ────────────────────────────────────────────────────────────────────
+@dataclass
+class MarketSentimentScore:
+    """多因子情绪综合评分"""
+    timestamp_ms: int
+    exchange: str
+    coin: str
+    oi_score: float             # -1 to +1
+    cvd_score: float
+    funding_score: float
+    ls_score: float
+    liq_score: float
+    vpin_score: float           # 订单流毒性
+    composite: float            # 加权综合 -100 to +100
+    label: str                  # 极度贪婪/贪婪/中性/恐惧/极度恐惧
+    color: str
+
+@dataclass
+class VPINPoint:
+    """VPIN 订单流毒性指标"""
+    timestamp_ms: int
+    exchange: str
+    vpin: float                 # 0-1
+    buy_vol_bucket: float
+    sell_vol_bucket: float
+    imbalance: float
+    alert: bool = False
+
+@dataclass
+class MicrostructureAnomaly:
+    """市场微结构异常"""
+    timestamp_ms: int
+    exchange: str
+    anomaly_type: str           # spread_spike / depth_collapse / quote_stuffing / spoofing
+    severity: str
+    detail: str
+    value: float
+    threshold: float
+
+@dataclass
+class CandlePatternSignal:
+    """K线形态信号"""
+    timestamp_ms: int
+    exchange: str
+    symbol: str
+    pattern: str                # pin_bar / engulfing / divergence / hammer / doji
+    direction: str              # bullish / bearish / neutral
+    confidence: float
+    price: float
+
+@dataclass
+class BacktestResult:
+    """信号回测结果"""
+    signal_type: str
+    exchange: str
+    coin: str
+    interval: str
+    total_signals: int
+    win_count: int
+    loss_count: int
+    win_rate: float
+    avg_return_pct: float
+    max_drawdown_pct: float
+    sharpe: float
+    from_ts: int
+    to_ts: int
+
+# ── 推送通知 ──────────────────────────────────────────────────────────────────
+@dataclass
+class PushNotificationConfig:
+    """推送配置"""
+    telegram_enabled: bool = False
+    telegram_token: str = ""
+    telegram_chat_id: str = ""
+    browser_enabled: bool = False
+    sound_enabled: bool = False
+    min_severity: str = "medium"    # low / medium / high / critical
+    cooldown_seconds: int = 60      # 同类告警冷却时间
+
+@dataclass
+class NotificationRecord:
+    """已发送通知记录"""
+    notification_id: str
+    timestamp_ms: int
+    channel: str                    # telegram / browser / sound
+    alert_type: str
+    message: str
+    severity: str
+    success: bool
+    error: Optional[str] = None
+
+# ── 持久化 ────────────────────────────────────────────────────────────────────
+@dataclass
+class PersistentOIRecord:
+    """持久化OI记录"""
+    timestamp_ms: int
+    coin: str
+    exchange: str
+    oi_notional: float
+    funding_rate: Optional[float]
+    price: Optional[float]
+
+@dataclass
+class DailyMarketSummary:
+    """每日市场摘要归档"""
+    date_str: str               # YYYY-MM-DD
+    coin: str
+    open_price: float
+    high_price: float
+    low_price: float
+    close_price: float
+    volume_24h: float
+    oi_open: float
+    oi_close: float
+    oi_change_pct: float
+    funding_avg_bps: float
+    liq_total: float
+    liq_long_pct: float
+    max_sentiment_score: float
+    min_sentiment_score: float

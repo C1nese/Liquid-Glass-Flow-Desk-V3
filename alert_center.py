@@ -153,7 +153,7 @@ def render_alert_center(confirmed_alerts: List[ConfirmedAlert],
     st.markdown("---")
     st.markdown("#### 告警时间线")
     from analytics import build_alert_timeline_figure
-    st.plotly_chart(build_alert_timeline_figure(alert_timeline), key="ac_timeline", use_container_width=True)
+    st.plotly_chart(build_alert_timeline_figure(alert_timeline), key="ac_timeline", config={'displayModeBar': True, 'scrollZoom': True})
 
     # ── Export ─────────────────────────────────────────────────────────────────
     if filtered:

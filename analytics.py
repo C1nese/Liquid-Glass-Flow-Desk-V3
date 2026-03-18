@@ -1230,3 +1230,265 @@ def build_replay_price_figure(frames: list, speed_label: str = "1x") -> go.Figur
     fig.update_xaxes(showgrid=False)
     fig.update_yaxes(showgrid=True, gridcolor=_GRID_COL)
     return fig
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# v7 新增：价格关口识别 / 多空力量面板 / 热点币发现
+# ══════════════════════════════════════════════════════════════════════════════
+
+def detect_price_levels(candles: list, ref_price: float,
+                         lookback: int = 120, min_touches: int = 2,
+                         tolerance_pct: float = 0.15) -> list:
+    """
+    自动识别支撑/阻力关口。
+    算法：找历史高低点聚集区，合并相近价位，按触碰次数排序。
+    返回 [{"price": float, "type": "support"/"resistance", "touches": int, "strength": float}]
+    """
+    if not candles or ref_price <= 0:
+        return []
+
+    candles = candles[-lookback:]
+    tol = ref_price * tolerance_pct / 100
+
+    # Collect pivot highs and lows
+    pivots = []
+    for i in range(2, len(candles) - 2):
+        h = candles[i].high
+        l = candles[i].low
+        # Pivot high: higher than neighbors
+        if h > candles[i-1].high and h > candles[i-2].high and            h > candles[i+1].high and h > candles[i+2].high:
+            pivots.append(("resistance", h))
+        # Pivot low: lower than neighbors
+        if l < candles[i-1].low and l < candles[i-2].low and            l < candles[i+1].low and l < candles[i+2].low:
+            pivots.append(("support", l))
+
+    # Add round number levels (整数关口)
+    magnitude = 10 ** (len(str(int(ref_price))) - 2)
+    round_base = round(ref_price / magnitude) * magnitude
+    for m in range(-5, 6):
+        rnd = round_base + m * magnitude
+        if rnd > 0 and abs(rnd - ref_price) / ref_price < 0.05:
+            pivots.append(("round", rnd))
+
+    # Cluster nearby pivots
+    clusters = []
+    used = set()
+    for i, (ptype, price) in enumerate(pivots):
+        if i in used:
+            continue
+        cluster_prices = [price]
+        cluster_types  = [ptype]
+        for j, (ptype2, price2) in enumerate(pivots):
+            if j != i and j not in used and abs(price2 - price) <= tol:
+                cluster_prices.append(price2)
+                cluster_types.append(ptype2)
+                used.add(j)
+        used.add(i)
+        avg_price = sum(cluster_prices) / len(cluster_prices)
+        touches   = len(cluster_prices)
+        # Determine type by majority or position vs ref
+        if "round" in cluster_types:
+            lvl_type = "resistance" if avg_price > ref_price else "support"
+        else:
+            lvl_type = max(set(cluster_types), key=cluster_types.count)
+        clusters.append({
+            "price":    round(avg_price, 2),
+            "type":     lvl_type,
+            "touches":  touches,
+            "strength": min(1.0, touches / 5.0),
+            "is_round": "round" in cluster_types,
+        })
+
+    # Filter by min touches, sort by distance from ref
+    result = [c for c in clusters if c["touches"] >= min_touches]
+    result.sort(key=lambda x: abs(x["price"] - ref_price))
+    return result[:12]
+
+
+def build_price_levels_annotations(fig, levels: list, ref_price: float,
+                                    row: int = 1, col: int = 1):
+    """把价格关口标注到 plotly 图上（水平线 + 文字标签）"""
+    for lvl in levels:
+        price   = lvl["price"]
+        ltype   = lvl["type"]
+        touches = lvl["touches"]
+        is_rnd  = lvl.get("is_round", False)
+
+        color = "#ff8866" if ltype == "resistance" else "#66ccff"
+        dash  = "dot" if is_rnd else "dash"
+        width = 0.8 + lvl["strength"] * 0.8
+
+        dist_pct = (price - ref_price) / ref_price * 100
+        label = f"{'R' if ltype=='resistance' else 'S'} {price:,.1f} ({dist_pct:+.2f}%)"
+        if is_rnd:
+            label = f"🔵 {label}"
+
+        fig.add_hline(
+            y=price, line_color=color, line_dash=dash, line_width=width,
+            annotation_text=label,
+            annotation_font=dict(color=color, size=10),
+            annotation_position="right",
+            row=row, col=col,
+        )
+    return fig
+
+
+def build_bull_bear_power_figure(snapshots: list, ob_levels: dict,
+                                  cvd_history: dict) -> "go.Figure":
+    """
+    多空力量实时面板：
+    - 买盘深度 vs 卖盘深度（盘口前N档名义值）
+    - CVD速率（最近N秒）
+    - 综合力量得分 -100 ~ +100
+    """
+    import plotly.graph_objects as go
+    from plotly.subplots import make_subplots
+
+    fig = make_subplots(
+        rows=1, cols=3,
+        subplot_titles=["盘口力量", "CVD速率", "综合力量"],
+        column_widths=[0.35, 0.35, 0.30],
+        specs=[[{"type": "xy"}, {"type": "xy"}, {"type": "indicator"}]],
+    )
+
+    ex_colors = {"binance":"#f0b90b","bybit":"#ff6b00","okx":"#00b4d8","hyperliquid":"#7c3aed",
+                 "Binance":"#f0b90b","Bybit":"#ff6b00","OKX":"#00b4d8","Hyperliquid":"#7c3aed"}
+
+    # 1. Bid/Ask depth bars per exchange
+    for snap in (snapshots or []):
+        if snap.status != "ok":
+            continue
+        ek = snap.exchange.lower()
+        levels = ob_levels.get(ek, [])
+        if not levels:
+            continue
+        bid_notional = sum(l.price * l.size for l in levels
+                           if l.side == "bid" and l.size > 0)
+        ask_notional = sum(l.price * l.size for l in levels
+                           if l.side == "ask" and l.size > 0)
+        color = ex_colors.get(snap.exchange, "#aaa")
+        fig.add_trace(go.Bar(
+            name=snap.exchange, x=[snap.exchange],
+            y=[bid_notional / 1e6], marker_color="#1dc796",
+            showlegend=False, offsetgroup=snap.exchange,
+        ), row=1, col=1)
+        fig.add_trace(go.Bar(
+            name=snap.exchange, x=[snap.exchange],
+            y=[-ask_notional / 1e6], marker_color="#ff6868",
+            showlegend=False, offsetgroup=snap.exchange,
+        ), row=1, col=1)
+
+    # 2. CVD velocity (last 10 points slope)
+    for ek, pts in (cvd_history or {}).items():
+        if len(pts) < 2:
+            continue
+        recent = list(pts)[-10:]
+        if len(recent) < 2:
+            continue
+        deltas = [p.delta for p in recent]
+        velocity = sum(deltas) / len(deltas)
+        color = ex_colors.get(ek, "#aaa")
+        fig.add_trace(go.Bar(
+            x=[ek.capitalize()], y=[velocity / 1e3],
+            marker_color="#1dc796" if velocity > 0 else "#ff6868",
+            name=ek, showlegend=False,
+        ), row=1, col=2)
+
+    # 3. Composite power score gauge
+    scores = []
+    for snap in (snapshots or []):
+        if snap.status != "ok":
+            continue
+        ek = snap.exchange.lower()
+        # Bid/Ask imbalance
+        levels = ob_levels.get(ek, [])
+        if levels:
+            bid_n = sum(l.price*l.size for l in levels if l.side=="bid")
+            ask_n = sum(l.price*l.size for l in levels if l.side=="ask")
+            total = bid_n + ask_n
+            if total > 0:
+                scores.append((bid_n - ask_n) / total * 100)
+    composite = sum(scores) / len(scores) if scores else 0
+    color = "#1dc796" if composite > 5 else "#ff6868" if composite < -5 else "#aaaaaa"
+
+    fig.add_trace(go.Indicator(
+        mode="gauge+number+delta",
+        value=composite,
+        delta={"reference": 0},
+        gauge={
+            "axis": {"range": [-100, 100]},
+            "bar":  {"color": color, "thickness": 0.3},
+            "steps": [
+                {"range": [-100, -20], "color": "rgba(255,104,104,0.2)"},
+                {"range": [-20, 20],   "color": "rgba(170,170,170,0.1)"},
+                {"range": [20, 100],   "color": "rgba(29,199,150,0.2)"},
+            ],
+        },
+        number={"font": {"size": 28, "color": color}},
+        title={"text": "买卖力量", "font": {"size": 12}},
+    ), row=1, col=3)
+
+# 用 add_shape 代替 add_hline，避免 Indicator 子图无 xaxis 导致的报错
+    for _col, _yref in [(1, "y"), (2, "y2")]:
+        fig.add_shape(
+            type="line", xref="paper", yref=_yref,
+            x0=0, x1=1, y0=0, y1=0,
+            line=dict(color="rgba(255,255,255,0.2)", width=1),
+        )
+    fig.update_layout(
+        height=320, barmode="relative",
+        template="plotly_dark",
+        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+        margin=dict(l=20, r=20, t=40, b=20),
+        legend=dict(orientation="h", y=1.08),
+    )
+    fig.update_yaxes(title_text="名义值(M$)", row=1, col=1)
+    fig.update_yaxes(title_text="速率(K$)", row=1, col=2)
+    return fig
+
+
+def detect_hot_coins(market_rows: list, top_n: int = 5) -> list:
+    """
+    热点币自动发现：综合 OI变化 / Vol变化 / Liq异常增速
+    返回 [{"coin", "reason", "score", "direction"}]
+    """
+    if not market_rows:
+        return []
+
+    scored = []
+    for row in market_rows:
+        score = 0.0
+        reasons = []
+
+        # OI异常增速
+        oi_chg = row.oi_change_1h_pct or 0
+        if abs(oi_chg) > 5:
+            score += min(40, abs(oi_chg) * 2)
+            reasons.append(f"OI{oi_chg:+.1f}%/1h")
+
+        # 资金费率极端
+        fr = row.funding_avg or 0
+        if abs(fr) > 8:
+            score += min(30, abs(fr) * 2)
+            reasons.append(f"FR{fr:+.1f}bps")
+
+        # 爆仓集中
+        liq = row.liq_24h_total or 0
+        if liq > 5_000_000:
+            score += min(30, liq / 1_000_000)
+            reasons.append(f"爆仓${liq/1e6:.1f}M")
+
+        if score > 10:
+            direction = "bull" if oi_chg > 0 and fr > 0 else                         "bear" if oi_chg < 0 else "neutral"
+            scored.append({
+                "coin":      row.coin,
+                "score":     round(score, 1),
+                "reason":    " · ".join(reasons),
+                "direction": direction,
+                "oi_chg_1h": oi_chg,
+                "fr_bps":    fr,
+                "liq_total": liq,
+            })
+
+    scored.sort(key=lambda x: x["score"], reverse=True)
+    return scored[:top_n]

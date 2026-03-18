@@ -473,7 +473,6 @@ class OkxClient(BaseClient):
                         inst_id = item.get("instId","")
                         if not inst_id.startswith(coin_upper): continue
                         oi_usd = safe_float(item.get("oiUsd"))
-                        # Get price
                         try:
                             tp = self._get("/api/v5/market/ticker", {"instId":inst_id})
                             price = safe_float((tp.get("data") or [{}])[0].get("last"))
@@ -487,6 +486,91 @@ class OkxClient(BaseClient):
                 except: pass
             return results
         except: return []
+
+    def fetch_open_interest_history(self, symbol: str, interval: str, limit: int):
+        """OKX OI历史（每隔一段时间的快照）"""
+        try:
+            okx_bar = {"1m":"1m","3m":"3m","5m":"5m","15m":"15m","30m":"30m",
+                       "1h":"1H","4h":"4H","1d":"1Dutc"}.get(interval,"5m")
+            p = self._get("/api/v5/rubik/stat/contracts/open-interest-history",
+                          {"instId":symbol,"period":okx_bar,"limit":str(min(limit,100))})
+            results = []
+            for item in (p.get("data") or []):
+                ts  = safe_int(item[0]) if item else None
+                oi  = safe_float(item[1]) if len(item) > 1 else None
+                oi_usd = safe_float(item[2]) if len(item) > 2 else None
+                if ts:
+                    results.append(OIPoint(timestamp_ms=ts,
+                                           open_interest=oi,
+                                           open_interest_notional=oi_usd))
+            return sorted(results, key=lambda x: x.timestamp_ms)[-limit:]
+        except:
+            return []
+
+    def fetch_liquidations(self, symbol: str, limit: int):
+        """OKX 强平记录"""
+        try:
+            # OKX liquidation orders endpoint
+            p = self._get("/api/v5/public/liquidation-orders",
+                          {"instType":"SWAP","instId":symbol,"state":"filled","limit":str(min(limit,100))})
+            events = []
+            now_ms = int(time.time() * 1000)
+            for item in (p.get("data") or []):
+                for detail in (item.get("details") or []):
+                    side_raw = str(detail.get("side","")).lower()
+                    # In OKX: liquidation "buy" means short position was liquidated
+                    side = "short" if side_raw == "buy" else "long"
+                    price = safe_float(detail.get("bkPx"))
+                    size  = safe_float(detail.get("sz"))
+                    ts    = safe_int(detail.get("ts")) or now_ms
+                    notional = compute_notional(price, size)
+                    events.append(LiquidationEvent(
+                        exchange=self.exchange_name, symbol=symbol,
+                        timestamp_ms=ts, side=side,
+                        price=price, size=size, notional=notional,
+                        source="rest", raw=detail))
+            return sorted(events, key=lambda x: x.timestamp_ms, reverse=True)[:limit]
+        except:
+            return []
+
+    def fetch_top_trader_ratio(self, symbol: str, interval: str, limit: int):
+        """OKX 大户多空持仓比"""
+        try:
+            okx_period = {"1m":"5m","3m":"5m","5m":"5m","15m":"15m","30m":"30m",
+                          "1h":"1H","4h":"4H","1d":"1Dutc"}.get(interval,"5m")
+            # Use coin from symbol like BTC-USDT-SWAP -> BTC
+            coin = symbol.split("-")[0]
+            p = self._get("/api/v5/rubik/stat/contracts/long-short-account-ratio",
+                          {"ccy":coin,"period":okx_period,"limit":str(min(limit,100))})
+            results = []
+            for item in (p.get("data") or []):
+                ts    = safe_int(item[0]) if item else None
+                ratio = safe_float(item[1]) if len(item) > 1 else None
+                if ts and ratio:
+                    results.append(TopTraderRatio(
+                        timestamp_ms=ts,
+                        long_short_ratio=ratio,
+                        long_account_ratio=ratio / (1 + ratio) * 100 if ratio else None,
+                    ))
+            return sorted(results, key=lambda x: x.timestamp_ms)[-limit:]
+        except:
+            return []
+
+    def fetch_global_long_short_ratio(self, symbol: str, interval: str, limit: int):
+        """OKX 全市场多空比（等同于 top trader ratio，OKX API 相同）"""
+        return self.fetch_top_trader_ratio(symbol, interval, limit)
+
+    def fetch_taker_long_short_ratio_okx(self, symbol: str, interval: str, limit: int):
+        """OKX 吃单买卖比例"""
+        try:
+            okx_period = {"1m":"5m","3m":"5m","5m":"5m","15m":"15m","30m":"30m",
+                          "1h":"1H","4h":"4H","1d":"1Dutc"}.get(interval,"5m")
+            coin = symbol.split("-")[0]
+            p = self._get("/api/v5/rubik/stat/taker-volume",
+                          {"ccy":coin,"instType":"CONTRACTS","period":okx_period,"limit":str(min(limit,100))})
+            return p.get("data", [])
+        except:
+            return []
 
 
 # ─── Hyperliquid ──────────────────────────────────────────────────────────────
@@ -712,3 +796,174 @@ class MarketScanClient(BaseClient):
 
 def build_market_scan_client(timeout: int = DEFAULT_TIMEOUT) -> MarketScanClient:
     return MarketScanClient(timeout)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# v6 增强 — HyperliquidClient 扩展 & 跨所工具函数
+# ══════════════════════════════════════════════════════════════════════════════
+
+class HyperliquidClientV2(HyperliquidClient):
+    """扩展版 Hyperliquid 客户端，覆盖所有 /info 端点"""
+
+    def fetch_all_fundings(self) -> Dict[str, float]:
+        """返回所有资产的当前资金费率 {coin: rate}"""
+        try:
+            payload = self._post("/info", {"type": "metaAndAssetCtxs"})
+            if not isinstance(payload, list) or len(payload) < 2:
+                return {}
+            universe = payload[0].get("universe", [])
+            ctx_list = payload[1]
+            result = {}
+            for i, asset in enumerate(universe):
+                coin = asset.get("name", "")
+                if i < len(ctx_list):
+                    fr = safe_float(ctx_list[i].get("funding"))
+                    if fr is not None:
+                        result[coin] = fr
+            return result
+        except:
+            return {}
+
+    def fetch_all_mids(self) -> Dict[str, float]:
+        """返回所有资产的最新中间价 {coin: mid_price}"""
+        try:
+            raw = self._post("/info", {"type": "allMids"})
+            if isinstance(raw, dict):
+                return {k: safe_float(v) for k, v in raw.items() if safe_float(v)}
+            return {}
+        except:
+            return {}
+
+    def fetch_open_interest_all(self) -> Dict[str, float]:
+        """返回所有资产的持仓量（以币计）"""
+        try:
+            payload = self._post("/info", {"type": "metaAndAssetCtxs"})
+            if not isinstance(payload, list) or len(payload) < 2:
+                return {}
+            universe = payload[0].get("universe", [])
+            ctx_list = payload[1]
+            mids = self.fetch_all_mids()
+            result = {}
+            for i, asset in enumerate(universe):
+                coin = asset.get("name", "")
+                if i < len(ctx_list):
+                    oi    = safe_float(ctx_list[i].get("openInterest"))
+                    price = mids.get(coin)
+                    if oi and price:
+                        result[coin] = oi * price  # notional
+            return result
+        except:
+            return {}
+
+    def fetch_recent_trades(self, symbol: str, limit: int = 100):
+        """获取最近成交（Hyperliquid trades endpoint）"""
+        try:
+            raw = self._post("/info", {"type": "recentTrades", "coin": symbol})
+            trades = []
+            now_ms = int(time.time() * 1000)
+            for t in (raw or [])[-limit:]:
+                side = "buy" if str(t.get("side", "")).upper() in ("B", "BUY") else "sell"
+                price = safe_float(t.get("px")) or 0.0
+                size  = safe_float(t.get("sz")) or 0.0
+                trades.append(TradeEvent(
+                    exchange=self.exchange_name, symbol=symbol,
+                    timestamp_ms=safe_int(t.get("time")) or now_ms,
+                    price=price, size=size, side=side,
+                    notional=price * size,
+                    source="rest",
+                ))
+            return trades
+        except:
+            return []
+
+    def fetch_open_interest_history(self, symbol: str, interval: str, limit: int):
+        """HL 目前没有直接的 OI 历史 REST，用 metaAndAssetCtxs 生成单点"""
+        snap = self.fetch(symbol)
+        if snap and snap.open_interest_notional:
+            return [OIPoint(
+                timestamp_ms=snap.timestamp_ms or int(time.time() * 1000),
+                open_interest=snap.open_interest,
+                open_interest_notional=snap.open_interest_notional,
+            )]
+        return []
+
+    def fetch_funding_history_hl(self, symbol: str, limit: int = 100) -> List[Dict]:
+        """获取 Hyperliquid 资金费率历史"""
+        try:
+            end_time   = int(time.time() * 1000)
+            start_time = end_time - 86400000 * 7  # 7天
+            raw = self._post("/info", {
+                "type": "fundingHistory",
+                "coin": symbol,
+                "startTime": start_time,
+                "endTime": end_time,
+            })
+            return [
+                {
+                    "timestamp_ms": safe_int(r.get("time")) or 0,
+                    "funding_rate": safe_float(r.get("fundingRate")),
+                    "premium": safe_float(r.get("premium")),
+                }
+                for r in (raw or [])[-limit:]
+            ]
+        except:
+            return []
+
+
+def build_clients_v2(timeout: int = DEFAULT_TIMEOUT) -> Dict[str, BaseClient]:
+    """v6 客户端工厂，Hyperliquid 使用扩展版"""
+    return {
+        "bybit":       BybitClient(timeout),
+        "binance":     BinanceClient(timeout),
+        "okx":         OkxClient(timeout),
+        "hyperliquid": HyperliquidClientV2(timeout),
+    }
+
+
+def fetch_all_exchange_fundings(coin: str,
+                                 timeout: int = DEFAULT_TIMEOUT
+                                 ) -> Dict[str, Optional[float]]:
+    """并发获取 4 所的当前资金费率，返回 {exchange: rate}"""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    clients = build_clients_v2(timeout)
+    syms    = default_symbols(coin)
+    results: Dict[str, Optional[float]] = {}
+
+    def _fetch(ek):
+        try:
+            snap = clients[ek].fetch(syms[ek])
+            return ek, snap.funding_rate if snap else None
+        except:
+            return ek, None
+
+    with ThreadPoolExecutor(max_workers=4) as ex:
+        futs = {ex.submit(_fetch, ek): ek for ek in EXCHANGE_ORDER}
+        for fut in as_completed(futs):
+            ek, rate = fut.result()
+            results[ek] = rate
+
+    return results
+
+
+def fetch_aggregated_oi(coin: str, timeout: int = DEFAULT_TIMEOUT
+                         ) -> Dict[str, Optional[float]]:
+    """并发获取4所 OI，返回 {exchange: notional}"""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    clients = build_clients_v2(timeout)
+    syms    = default_symbols(coin)
+    results: Dict[str, Optional[float]] = {}
+
+    def _fetch(ek):
+        try:
+            snap = clients[ek].fetch(syms[ek])
+            return ek, snap.open_interest_notional if snap else None
+        except:
+            return ek, None
+
+    with ThreadPoolExecutor(max_workers=4) as ex:
+        futs = {ex.submit(_fetch, ek): ek for ek in EXCHANGE_ORDER}
+        for fut in as_completed(futs):
+            ek, oi = fut.result()
+            results[ek] = oi
+
+    return results

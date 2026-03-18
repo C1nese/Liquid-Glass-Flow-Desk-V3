@@ -199,24 +199,24 @@ def render_ob_center(quality_hist, fake_walls, absorptions,
     r1l, r1r = st.columns(2, gap="large")
     with r1l:
         st.markdown("#### 撤单速度监控")
-        st.plotly_chart(build_cancel_speed_figure(quality_hist), key="ob_cancel", use_container_width=True)
+        st.plotly_chart(build_cancel_speed_figure(quality_hist), key="ob_cancel", config={'displayModeBar': True, 'scrollZoom': True})
     with r1r:
         st.markdown("#### 墙体寿命")
-        st.plotly_chart(build_wall_lifetime_figure(wall_hist, active_walls), key="ob_wall_life", use_container_width=True)
+        st.plotly_chart(build_wall_lifetime_figure(wall_hist, active_walls), key="ob_wall_life", config={'displayModeBar': True, 'scrollZoom': True})
 
     # Row 2: Fake walls + Near collapse
     r2l, r2r = st.columns(2, gap="large")
     with r2l:
         from analytics import build_fake_wall_figure
         st.markdown("#### 假挂单 & 大单吸收")
-        st.plotly_chart(build_fake_wall_figure(fake_walls, absorptions), key="ob_fake", use_container_width=True)
+        st.plotly_chart(build_fake_wall_figure(fake_walls, absorptions), key="ob_fake", config={'displayModeBar': True, 'scrollZoom': True})
     with r2r:
         st.markdown("#### 近价流动性塌陷")
-        st.plotly_chart(build_near_collapse_figure(collapses), key="ob_collapse", use_container_width=True)
+        st.plotly_chart(build_near_collapse_figure(collapses), key="ob_collapse", config={'displayModeBar': True, 'scrollZoom': True})
 
     # Row 3: Large order flow
     st.markdown("#### 大单流 (主动买卖 > $50K)")
-    st.plotly_chart(build_large_order_flow_figure(large_flows), key="ob_lof", use_container_width=True)
+    st.plotly_chart(build_large_order_flow_figure(large_flows), key="ob_lof", config={'displayModeBar': True, 'scrollZoom': True})
 
     # Active walls table
     if active_walls:
@@ -225,7 +225,7 @@ def render_ob_center(quality_hist, fake_walls, absorptions,
             "价格": w.price, "金额$K": round(w.notional/1e3, 1),
             "存活秒数": round(w.age_ms/1000, 1)} for w in active_walls.values()]
         wall_rows.sort(key=lambda x: x["金额$K"], reverse=True)
-        st.dataframe(pd.DataFrame(wall_rows[:20]), use_container_width=True, hide_index=True,
+        st.dataframe(pd.DataFrame(wall_rows[:20]), width='stretch', hide_index=True,
             column_config={"价格": st.column_config.NumberColumn(format="%.2f"),
                 "金额$K": st.column_config.NumberColumn(format="%.1f"),
                 "存活秒数": st.column_config.NumberColumn(format="%.1f")})
@@ -237,6 +237,6 @@ def render_ob_center(quality_hist, fake_walls, absorptions,
             "方向": "买" if f.side=="bid" else "卖",
             "价格": f.price, "峰值$K": round(f.peak_notional/1e3,1),
             "存续ms": f.lifespan_ms} for f in list(fake_walls)[-20:]]
-        st.dataframe(pd.DataFrame(fw_rows), use_container_width=True, hide_index=True,
+        st.dataframe(pd.DataFrame(fw_rows), width='stretch', hide_index=True,
             column_config={"价格": st.column_config.NumberColumn(format="%.2f"),
                 "峰值$K": st.column_config.NumberColumn(format="%.1f")})
