@@ -1,4 +1,5 @@
 # 多交易所流动性终端 基础班 （另有VIP版）
+在线版 https://liquid-glass-flow-desk-v3-mcztcgxhssphs7aig4fcvy.streamlit.app/
 
 > **Liquid Glass Flow Desk** — 面向加密货币交易者的专业级实时流动性监控系统  
 > 基于 Streamlit 构建，WebSocket 驱动，支持 Binance / Bybit / OKX / Hyperliquid 四所并发数据。
