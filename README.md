@@ -1,67 +1,331 @@
-# Liquid-Glass-Flow-Desk-V3
-Liquid Glass Flow Desk 普通V3版本
-# 多交易所流动性终端 v4
-### Multi-Exchange Crypto Liquidity Terminal
+# 多交易所流动性终端 
 
-> **实盘级**加密货币流动性监控系统。四所 WebSocket 实时数据流 · 三所现货-合约价差 · 告警去抖动引擎 · OI+CVD+Funding 合成信号 · 爆仓簇跨所联动 · 盘口质量与假挂单检测 · 事件回放复盘。
+> **Liquid Glass Flow Desk** — 面向加密货币交易者的专业级实时流动性监控系统  
+> 基于 Streamlit 构建，WebSocket 驱动，支持 Binance / Bybit / OKX / Hyperliquid 四所并发数据。
 
 ---
 
 ## 目录
 
-1. [功能概览](#功能概览)
-2. [快速上手](#快速上手)
-3. [界面导航（17个Tab）](#界面导航)
-4. [系统架构](#系统架构)
-5. [数据模型](#数据模型)
-6. [告警引擎](#告警引擎)
-7. [合成信号](#合成信号)
-8. [盘口质量检测](#盘口质量检测)
-9. [爆仓簇 V2](#爆仓簇-v2)
-10. [回放复盘](#回放复盘)
-11. [配置参数](#配置参数)
-12. [文件结构](#文件结构)
-13. [FAQ](#faq)
+- [功能概览](#功能概览)
+- [快速启动](#快速启动)
+- [依赖安装](#依赖安装)
+- [界面与 Tab 导航](#界面与-tab-导航)
+- [信号增强中心](#信号增强中心)
+- [告警与推送系统](#告警与推送系统)
+- [持久化存储](#持久化存储)
+- [项目结构](#项目结构)
+- [数据模型](#数据模型)
+- [配置参数](#配置参数)
+- [版本变更记录](#版本变更记录)
 
 ---
 
 ## 功能概览
 
-| 模块 | 说明 |
+| 类别 | 功能 |
 |------|------|
-| 🏛️ **四所实时行情** | Binance / Bybit / OKX / Hyperliquid 合约 WS |
-| 📡 **三所现货 WS** | Bybit Spot + OKX Spot 真实 WS；Binance 用 Index Price |
-| 📊 **OI 可视化** | 持仓量 + 彩色变化柱 + 速率曲线 |
-| 💧 **CVD 主动买卖** | Taker Buy/Sell 累积量差，Binance K线 taker 字段最准 |
-| 🔗 **Spot-Perp 价差** | 三所实时价差折线 + Lead/Lag 告警 |
-| 🧠 **合成信号引擎** | 价格×OI×CVD×Funding×Crowd → 偏多/偏空/衰竭/吸收 |
-| 💥 **爆仓瀑布 V2** | 多/空分栏 · 单所/跨所联动 · 爆仓簇气泡图 · 甘特时间轴 |
-| 📋 **盘口质量** | 逐档新增/撤单追踪 · 假挂单检测 · 吸收事件识别 |
-| ⏰ **告警时间线** | 去抖动确认（强2次/中3次/弱4次）· 可视化时间线 |
-| 📼 **回放复盘** | 1x/5x/20x 速度 · 价格+CVD+爆仓同帧 · 最多1小时录制 |
-| 🔔 **自定义预警** | 价格/OI/费率/CVD/OI速率 阈值告警 |
-| 📡 **多币种轮巡** | 最多15个币种快速扫描 |
+| **实时行情** | 四所 WebSocket 并发，价格 / OI / 资金费率 / 成交流毫秒级更新 |
+| **订单簿** | 本地维护 Level-2 订单簿，假墙检测 / 吸收事件 / 流动性缺口 |
+| **CVD / 主动买卖** | Taker 成交量累积差分，WS 实时 + K线回溯两路来源自动切换 |
+| **OI 分析** | 四象限（加仓/减仓/回补/减仓）+ 速率图 + 跨周期回填 |
+| **爆仓中心** | 五视角：瀑布图 / 密度热图 / 跨所联动 / 级联评分 / 时间轴 |
+| **合成信号** | Price × OI × CVD × Funding × Crowd 五因子加权，置信度评估，**权重可调** |
+| **技术指标** | MA(5/20/60) / 布林带(20,2) / RSI(14) / **MACD(12,26,9)** / **ATR(14)** |
+| **市场扫描** | 28 币种批量扫描，热点异动自动排名，**Treemap 热力图**（5 种指标） |
+| **跨所套利** | 价格价差套利信号 + 资金费率套利年化估算 |
+| **HL 链上中心** | Hyperliquid 专属：鲸鱼持仓 / 排行榜 / 预测资金费率 / 清算密度 |
+| **推送告警** | Telegram Bot + 浏览器通知，冷却时间 + 去抖确认机制 |
+| **历史归档** | SQLite WAL 模式，OI / 资金费率 / 告警历史本地持久化 |
+| **事件回放** | 最长 1 小时录制，逐帧回放价格 / OI / CVD / 告警 |
 
 ---
 
-## 快速上手
-
-### 环境要求
-
-- Python **3.10+**
-- 依赖（见 `requirements.txt`）：
+## 快速启动
 
 ```bash
-pip install streamlit>=1.31 requests>=2.31 pandas>=1.5 plotly>=5.20 websocket-client>=1.8
-```
+# 1. 安装依赖
+pip install -r requirements.txt
 
-### 启动
-
-```bash
+# 2. 启动
 streamlit run app.py
+
+# 3. 浏览器访问
+# http://localhost:8501
 ```
 
-默认访问 `http://localhost:8501`
+启动后在左侧边栏选择币种（默认 BTC），系统会自动建立四所 WebSocket 连接并开始实时更新。
+
+---
+
+## 依赖安装
+
+**Python ≥ 3.9** 推荐 3.11。
+
+```txt
+streamlit>=1.35.0
+pandas>=2.0.0
+plotly>=5.20.0
+websocket-client>=1.8.0
+requests>=2.31.0
+```
+
+完整安装：
+
+```bash
+pip install streamlit pandas plotly websocket-client requests
+```
+
+Telegram 推送（可选）：无需额外依赖，在「推送&历史数据」Tab 填入 Bot Token 和 Chat ID 即可。
+
+---
+
+## 界面与 Tab 导航
+
+系统分为 **21 个主 Tab**，覆盖从行情到信号的完整分析链路：
+
+### 第一行：核心功能
+
+| Tab | 功能 | 核心内容 |
+|-----|------|---------|
+| 🏠 全市场首页 | 市场大盘扫描 | 28 币种 OI / Funding / 爆仓异动排名，热点自动识别 |
+| 📈 深度终端 | 主力分析视图 | K 线 + 技术指标 + 热力盘口 + 爆仓叠加 + 跨周期联动 |
+| 💧 CVD主动买卖 | 成交流分析 | CVD 时序图 + 多空力量面板 + 成交明细流 |
+| 🔲 本地WS订单簿 | 实时盘口 | WebSocket 维护的 Level-2 深度图，买卖双向可视化 |
+| 👥 OI四象限+速率 | 持仓方向 | 加仓/减仓/回补/减仓四象限散点图 + 速率趋势 |
+| 📊 多空比矩阵 | 多空拥挤度 | Binance 大户 / 全市场账户比 + Bybit Taker 比 + 仪表盘 |
+| 🔗 Spot-Perp 价差 | 现货领先信号 | 三所实时价差走势 + 乖离告警（现货先行 / 极端乖离） |
+| 📐 Basis+期限结构 | 基差分析 | 合约溢价率 + 期限结构图 + 现货 vs 合约持仓对比 |
+
+### 第二行：专项分析
+
+| Tab | 功能 | 核心内容 |
+|-----|------|---------|
+| 💥 爆仓中心 | 五视角爆仓 | 瀑布图 / 热力密度 / 跨所联动时间轴 / 级联评分 |
+| 🔍 冰山单+流动性缺口 | 隐蔽订单 | 同价位反复成交检测冰山单 + 挂单骤减缺口 |
+| 🧠 合成信号引擎 | 综合信号 | 五因子加权合成分 + 雷达图 + 因子明细表 |
+| 📋 盘口中心 | 盘口质量 | 假挂单检测 / 墙体吸收 / 近价流动性崩溃 / 大单流 |
+| 🔔 告警中心 | 告警管理 | 已确认告警流 + 时间轴 + 声音 / 静音控制 |
+| 📼 回放复盘 | 事件录制 | 最长 1h 录制，逐帧回放价格、OI、CVD、告警 |
+| 🌐 全市场对比 | 多所对比 | 四所关键指标并排对比 |
+| 📡 多币种轮巡 | 批量监控 | 自选列表多币种快速巡视 |
+| ⚙️ 预警规则 | 自定义告警 | 价格 / OI / 资金费率 / 爆仓额 / CVD / 价差 / OI速率 七类条件 |
+
+### 第三行：增强功能
+
+| Tab | 功能 | 核心内容 |
+|-----|------|---------|
+| ⛓️ HL链上中心 | Hyperliquid 专属 | 鲸鱼持仓排行 / 预测资金费率 / 金库列表 / 清算密度 |
+| 🧬 信号增强中心 | 深度信号分析 | 套利监控 / 情绪评分 / VPIN / K线形态 / **权重调节** / **热力扫描** |
+| 📡 推送&历史数据 | 推送配置 | Telegram / 浏览器通知配置 + OI / 资金费率历史查询 |
+| 🔧 调试 | 系统状态 | WS 健康状态 / 快照原始数据 / 连接诊断 |
+
+---
+
+## 信号增强中心
+
+「🧬 信号增强中心」包含 **12 个子 Tab**：
+
+| 子 Tab | 说明 |
+|--------|------|
+| ⚡ 套利监控 | 跨所价差套利（最小价差可调）+ 资金费率套利年化估算 |
+| 🌡️ 情绪评分 | 六因子情绪仪表盘（OI / CVD / Funding / L-S / 爆仓 / VPIN） |
+| 🧪 VPIN毒性 | 成交量桶订单流毒性，高于 0.7 触发方向性预警 |
+| 📊 K线形态 | Pin bar / 吞没 / 锤子 / 十字星自动识别 + 快速回测 |
+| 🏛️ 交易所主导权 | 四所 OI 份额实时动态，主导权转移可视化 |
+| 🔬 微结构异常 | 价差突扩 / 深度塌陷检测，流动性危机早期信号 |
+| 💥 聚合爆仓流 | 四所爆仓事件合并流，按交易所分组柱状图 + 过滤器 |
+| 🐋 大单流量聚合 | 鲸鱼踪迹：大额成交方向性分析，时间窗口可选 |
+| 🎭 墙体消失告警 | 假挂单（快速撤离）+ 吸收事件（被吃后补单） |
+| 📈 多币种横向对比 | 多币同框对比 + 分组柱状图 + **热力矩阵** |
+| ⚖️ 信号权重调节 | **P1 新增**：五因子权重滑块 + 三套快速预设，实时同步到合成信号引擎 |
+| 🗺️ 市场热力扫描 | **P1 新增**：全市场 Treemap，支持 OI变化% / 资金费率 / 爆仓额 / 成交量 / 价格变化五种指标 |
+
+### 合成信号权重预设
+
+| 预设方案 | Price | OI | CVD | Funding | Crowd | 适用场景 |
+|---------|-------|-----|-----|---------|-------|---------|
+| 📊 均衡 | 20% | 20% | 20% | 20% | 20% | 多因子平衡 |
+| 🌊 流动性优先 | 10% | 30% | 40% | 10% | 10% | 成交流主导行情 |
+| 💰 费率优先 | 15% | 20% | 15% | 35% | 15% | 资金费率套利场景 |
+
+---
+
+## 告警与推送系统
+
+### 内置告警类型
+
+系统内置 **8 类**自动告警，由 WebSocket 实时触发，经去抖确认后推送：
+
+| 告警类型 | 触发条件 |
+|---------|---------|
+| 🟢 现货先拉↑ | 现货价格领先合约上涨超阈值 |
+| 🔴 现货先跌↓ | 现货价格领先合约下跌超阈值 |
+| ⚠️ OI升/买弱 | OI 持续上升但 CVD 偏弱，隐患累积 |
+| 🔵 OI降/轧空 | OI 下降同时 CVD 转正，潜在逼空 |
+| 🚨 极端乖离 | 现货-合约价差超过极端阈值 |
+| ⚡ 拥挤+爆仓 | 多头拥挤 + 大规模爆仓同时出现 |
+| 🎭 假挂单 | 大额挂单出现后 8 秒内消失 |
+| 🧠 合成信号 | 五因子综合分绝对值 > 0.6 且置信度 > 60% |
+
+### 自定义预警规则
+
+在「⚙️ 预警规则」Tab 中可创建任意数量的自定义规则：
+
+- **监控指标**：最新价 / 持仓金额 / 资金费率 / 爆仓额(60min) / CVD累积 / 价差bps / OI速率/min
+- **触发条件**：超过 / 低于 / 向上穿越 / 向下穿越
+- **去抖机制**：Strong=2次确认 / Medium=3次 / Weak=4次，防止噪音触发
+
+### 推送渠道
+
+| 渠道 | 配置方式 | 说明 |
+|------|---------|------|
+| **Telegram** | Bot Token + Chat ID | 支持格式化消息，含告警类型 / 交易所 / 严重度 |
+| **浏览器通知** | 页面授权 | 基于 Web Notification API，标签页后台运行时仍可推送 |
+
+推送频率受冷却时间保护：Strong=90s / Medium=180s / Weak=300s。
+
+---
+
+## 持久化存储
+
+本地 SQLite 数据库（`market_data.db`），**WAL 模式**，支持读写并发：
+
+| 表名 | 内容 | 用途 |
+|------|------|------|
+| `oi_history` | 时间戳 / 币种 / 交易所 / OI名义值 / 资金费率 / 价格 | OI 历史回溯，支持多所多币查询 |
+| `funding_history` | 时间戳 / 币种 / 交易所 / 费率 / 预测费率 | 资金费率历史，可导出 CSV |
+| `daily_summary` | 日期 / 开高低收 / 成交量 / OI变化 / 平均费率 / 爆仓总额 | 每日市场摘要，UNIQUE(date, coin) |
+| `alert_history` | 时间戳 / 交易所 / 告警类型 / 严重度 / 消息 / 得分 | 告警历史回溯 |
+| `notification_log` | 时间戳 / 渠道 / 消息 / 是否成功 | 推送日志 |
+
+数据自动每 5 分钟归档（由后台 sampler 线程触发），可在「推送&历史数据」Tab 查询历史并导出。
+
+---
+
+## 项目结构
+
+```
+.
+├── app.py                # 主入口：Streamlit 页面 + Fragment 渲染 + 侧边栏
+├── analytics.py          # 图表构建：K线/CVD/OI/爆仓/热图/信号/MACD/ATR
+├── aggregator.py         # 跨所聚合：套利信号/情绪评分/VPIN/热力图/权重计算
+├── realtime.py           # LiveTerminalService：WS管理/快照/告警引擎/录制
+├── exchanges.py          # 交易所 REST 客户端：Bybit/Binance/OKX/Hyperliquid
+├── models.py             # 数据模型：61 个 dataclass（行情/订单簿/信号/告警等）
+├── signal_center.py      # 信号增强中心 Tab（12个子Tab）
+├── homepage.py           # 全市场首页：批量扫描/异动排行/热点识别
+├── liq_center.py         # 爆仓中心 Tab：五视角爆仓分析
+├── ob_center.py          # 盘口中心 Tab：质量评分/假墙/吸收事件
+├── alert_center.py       # 告警中心 Tab：告警流/时间轴/声音控制
+├── hl_center.py          # Hyperliquid 链上中心 Tab
+├── hl_client.py          # Hyperliquid 完整 API 封装
+├── notifier.py           # 推送通知：Telegram/浏览器，冷却管理
+├── push_settings.py      # 推送配置 Tab + 历史数据查询
+├── storage.py            # SQLite 持久化层，WAL 模式
+└── market_data.db        # 本地数据库（运行后自动生成）
+```
+
+---
+
+## 数据模型
+
+`models.py` 定义了 **61 个 dataclass**，覆盖系统所有数据对象：
+
+**行情与订单簿**
+`ExchangeSnapshot` · `Candle` · `OIPoint` · `OrderBookLevel` · `LocalOrderBook` · `TradeEvent` · `CVDPoint`
+
+**信号与分析**
+`CompositeSignal` · `OIDeltaPoint` · `SpotPerpSpreadPoint` · `SpotPerpAlert` · `IcebergAlert` · `LiquidityGap` · `FakeWallCandidate` · `WallAbsorptionEvent` · `OrderBookQualitySnapshot`
+
+**爆仓**
+`LiquidationEvent` · `LiquidationClusterV2` · `NearLiquidityCollapse` · `MultiExchangeLiqSummary`
+
+**告警**
+`AlertRule` · `AlertEvent` · `ConfirmedAlert` · `AlertTimeline`
+
+**聚合与情绪**
+`CrossExArbitrageSignal` · `CrossExFundingArb` · `AggregatedOIPoint` · `ExchangeDominancePoint` · `MarketSentimentScore` · `VPINPoint` · `MicrostructureAnomaly` · `CandlePatternSignal` · `BacktestResult`
+
+**Hyperliquid 专属**
+`HLWhalePosition` · `HLLeaderEntry` · `HLPredictedFunding` · `HLVaultInfo` · `HLLiquidationDensity`
+
+**持久化**
+`PersistentOIRecord` · `DailyMarketSummary` · `PushNotificationConfig` · `NotificationRecord`
+
+---
+
+## 配置参数
+
+所有参数均可在左侧边栏实时调节，**无需重启**：
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| 主图交易所 | Binance | 深度终端的主图数据来源 |
+| K线周期 | 5m | 1m / 3m / 5m / 15m / 30m / 1h / 4h / 1d |
+| K线数量 | 240 | 120 ~ 480 根 |
+| 盘口深度 | 160 | REST 拉取档位数（WS 实时维护独立） |
+| 基础刷新秒数 | 2s | 1 ~ 10s，智能刷新模式下自动调速 |
+| 智能刷新 | 开启 | 波动大时加速至 1s，平静时减速至 5s |
+| 持仓采样秒数 | 15s | OI / Funding REST 轮询间隔 |
+| 请求超时 | 10s | REST 请求超时时间 |
+| 爆仓统计分钟 | 60min | 爆仓指标的时间窗口 |
+
+**K线技术指标**（侧边栏勾选启用）：
+
+| 指标 | 参数 | 说明 |
+|------|------|------|
+| MA 均线 | 5 / 20 / 60 | 黄/蓝/橙三色均线 |
+| 布林带 | 20, 2σ | 紫色虚线 + 填充带 |
+| RSI | 14 | 紫色，超买/超卖区域高亮 |
+| MACD | 12, 26, 9 | 绿/红柱 + DIF/DEA 线，独立子图 |
+| ATR | 14 | Wilder EMA 真实波动率，橙色面积图 |
+
+---
+
+## 版本变更记录
+
+### v7（当前版本）
+
+**P0 — Bug 修复**
+- 修复 `build_bull_bear_power_figure` 中 `add_hline` 对 Plotly Indicator 子图检查 `xaxis` 导致的 `PlotlyKeyError` 崩溃，改用 `add_shape`
+
+**P1 — 功能深化**
+- `analytics.py`：新增 `calc_macd` / `calc_atr` / `build_macd_atr_figure`，MACD 和 ATR 作为独立子图嵌入 K 线图下方
+- `aggregator.py`：新增 `compute_composite_score`（权重可配置）、`build_market_heatmap`、`build_market_heatmap_figure`（Treemap）
+- `signal_center.py`：新增「⚖️ 信号权重调节」Tab（滑块 + 三套预设）和「🗺️ 市场热力扫描」Tab
+- `realtime.py`：新增 `set_composite_weights` 公共方法，合成信号权重从 UI 实时注入
+
+**P2 — 架构优化**
+- `app.py`：所有 `load_*` 缓存函数从裸 `except: pass` 改为结构化 `logging.warning`，错误不再静默
+- `storage.py`：启用 SQLite WAL 日志模式 + `synchronous=NORMAL` + 8MB 页缓存，高频写入延迟显著降低
+- `realtime.py`：Spot WS Worker 重连从固定 3s 改为指数退避（3→6→12…→60s），与主合约 WS 策略对齐
+
+### v6
+- 信号增强中心（VPIN / 微结构异常 / K线形态 / 回测）
+- Hyperliquid 链上中心（鲸鱼持仓 / 排行榜 / 预测资金费率 / 金库）
+- 推送通知系统（Telegram / 浏览器）+ SQLite 历史归档
+- 事件录制与回放（最长 1 小时）
+- 爆仓级联评分 v2 + 跨所联动检测
+
+### v5
+- 现货 WS 接入（Bybit / OKX），Spot-Perp 价差实时计算
+- 盘口中心（假挂单 / 墙体吸收 / 近价流动性崩溃 / 大单流）
+- 告警中心（确认告警流 / 时间轴 / 声音控制）
+- 复合信号引擎（雷达图 + 五因子明细）
+
+---
+
+## 注意事项
+
+1. **网络要求**：需要能访问 Binance / Bybit / OKX / Hyperliquid 的 API 域名，部分地区需代理
+2. **首次启动**：WebSocket 建立约需 5~10 秒，期间部分指标显示「等待数据」属正常
+3. **多用户场景**：`st.cache_data` 为进程级缓存，多人同时使用同一实例时数据共享，如需隔离请分别部署
+4. **数据库清理**：`market_data.db` 长期运行会持续增长，可在「推送&历史数据」Tab 手动触发清理，或设置操作系统定时任务删除旧数据
+
+---
+
+*本项目为个人量化工具，数据仅供参考，不构成任何投资建议。*
 
 ### 第一次使用
 
